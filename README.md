@@ -122,13 +122,17 @@ Machine-local exception on both: weather-dashboard's vendored
    to carry (`DL_HEALTH_REQUIRE`) and/or a data timestamp that must be recent
    (`DL_HEALTH_FRESH`). An endpoint that only says ok is how a deploy deleted
    a box's `.env` and a card vanished for a day.
-2. Records the rollback point: tags each running image `<image>:pre-<sha>`,
-   snapshots the compose directory on the box, and pushes git tag
-   `rollback-point/<service>/<time>` on the commit the box was running.
+2. Records the rollback point: tags each running image
+   `<image>:pre-<time>-<sha>` (the newest few are kept; hand-made `pre-*`
+   tags are never pruned), snapshots the compose directory on the box, and
+   pushes git tag `rollback-point/<service>/<time>` on the commit the box was
+   running.
 3. Runs the config's `dl_sync`, then checks required files and env values on
    the box (`DL_REQUIRE_FILES=".env"`, `DL_REQUIRE_ENV=".env:HA_TOKEN"`)
    before anything restarts.
-4. `docker compose up -d --build`, then polls health.
+4. `docker compose up -d --build`, then polls health, and checks once more
+   after `DL_HEALTH_SETTLE` seconds. If the app can report its commit,
+   `DL_HEALTH_COMMIT` proves the new version is the one answering.
 5. Healthy: records the commit on the box, pushes `deploy/<service>/<time>-<sha>`.
    Unhealthy: restores the files and images, recreates without building,
    checks health again, pushes `failed-deploy/<service>/<time>-<sha>`.
