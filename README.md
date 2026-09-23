@@ -138,10 +138,28 @@ Machine-local exception on both: weather-dashboard's vendored
    publishes); it runs only once the JSON passes, and it never replaces it.
 5. Healthy: records the commit on the box, pushes `deploy/<service>/<time>-<sha>`.
    Unhealthy: restores the files and images, recreates without building,
-   checks health again, pushes `failed-deploy/<service>/<time>-<sha>`.
+   judges the old version again, pushes `failed-deploy/<service>/<time>-<sha>`.
 
-Exit codes: 0 ok, 1 rolled back and healthy, 2 down (manual command printed),
-3 refused before restarting, 4 deployed but a tag push failed.
+A rollback is judged by what the old version proved before the deploy, never
+by more. It is probed with the full gate first: if it passed, the rollback
+must pass the full gate again; if not (a version from before the gate, no
+deploy record, a source already down), the rollback must answer liveness
+(`DL_LIVENESS_URL`, for example `/health`), plus `dl_health_extra` if that
+passed before. The log names the gate used. "SERVICE IS DOWN" is printed only
+when liveness does not answer.
+
+Git tags are pushed only to a remote known to be private (a GitHub remote is
+asked with `gh api`; a local path counts as private; another host needs
+`DL_TAG_REMOTE_PRIVATE=1`), or the deploy stops before changing anything. A
+public repo sets `DL_TAG_PUSH=local`: the tags stay in the deploying clone.
+Every outcome is also appended to `deploys.log` in the service's state dir on
+the box, so the record exists either way.
+
+Exit codes: 0 ok; 1 rolled back and the old version passes what it passed
+before; 2 down, liveness fails (manual command printed); 3 refused before
+restarting; 4 deployed but a tag could not be made or pushed; 5 up but not as
+intended (the rollback is incomplete, or the old version answers liveness but
+fails a check it passed before).
 `homelab-deploy <config> --health` runs the gate once against what runs now.
 
 ## Tests

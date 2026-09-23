@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Fake gh for the tag-remote privacy check: "gh api repos/<slug> --jq .private".
+# $STUB_STATE/gh_private holds the answer (true / false); gh_fail makes it fail.
+S="$STUB_STATE"
+printf 'gh %s\n' "$*" >>"$S/calls"
+[[ -e "$S/gh_fail" ]] && { echo "gh: HTTP 401: Bad credentials" >&2; exit 1; }
+cat "$S/gh_private" 2>/dev/null || echo true

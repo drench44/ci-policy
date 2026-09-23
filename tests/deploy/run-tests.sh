@@ -37,12 +37,18 @@ setup() {
   echo c1 >"$STUB_STATE/ps/web"
   echo sha256:OLDID >"$STUB_STATE/inspect/c1"
   echo 'ok {"ok":true}' >"$STUB_STATE/health"
+  # The version running before the deploy passes the gate (the usual case);
+  # tests about a running version that does not, remove or change this.
+  echo 'ok {"ok":true}' >"$STUB_STATE/health_pre"
 }
 
 # Run dl_run in a subshell with stubs first on PATH. Sets RC and OUT.
 run_deploy() {
   OUT=$({
     PATH="$HERE/stubs:$PATH"
+    # Only local pushes: a test with a github.com remote must fail its push
+    # at once, never reach the network or wait at a credential prompt.
+    export GIT_ALLOW_PROTOCOL=file GIT_TERMINAL_PROMPT=0
     # shellcheck source=../../deploy/deploy-lib.sh
     source "$LIB"
     DL_SERVICE=hub DL_COMPOSE_DIR="$T/compose" DL_HEALTH_URL="http://box/health"
@@ -84,15 +90,16 @@ assert_contains "$CALLS" "docker tag hub-web:$PRE hub-web:latest"
 assert_contains "$CALLS" "docker compose up -d --no-build --force-recreate web"
 assert_eq "$(cat "$STUB_STATE/tags/hub-web_latest")" "sha256:OLDID" "(latest retagged to old image)"
 assert_eq "$(git -C "$T/origin.git" tag -l 'deploy/*')" "" "(no deploy tag on failure)"
-assert_contains "$OUT" "rolled back and the old version is healthy"
+assert_contains "$OUT" "rolled back, and the old version passes the full health gate (http://box/health)"
 teardown
 
-setup "predicate false counts as unhealthy"
+setup "predicate false counts as unhealthy (and a rollback that still answers is degraded, not down)"
 echo 'ok {"ok":false}' >"$STUB_STATE/health"
 run_deploy DL_HEALTH_TIMEOUT=0
-assert_eq "$RC" 2
+assert_eq "$RC" 5
 assert_contains "$OUT" "DL_HEALTH_JQ predicate is not true"
-assert_contains "$OUT" "ROLLBACK FAILED"
+assert_contains "$OUT" "ROLLED BACK and the old version is UP"
+assert_not_contains "$OUT" "SERVICE IS DOWN"
 teardown
 
 setup "health that recovers within the timeout passes"
@@ -213,7 +220,7 @@ teardown
 setup "non-JSON body is unhealthy"
 echo 'ok <html>' >"$STUB_STATE/health"
 run_deploy DL_HEALTH_TIMEOUT=0
-assert_eq "$RC" 2
+assert_eq "$RC" 5 "(it answers, so it is not down)"
 assert_contains "$OUT" "not JSON"
 teardown
 
@@ -521,6 +528,7 @@ assert_contains "$OUT" "then not healthy"
 teardown
 
 setup "the version running now is probed first and a failure is only a warning"
+rm "$STUB_STATE/health_pre"
 run_deploy DL_TAG_PUSH=0
 assert_eq "$RC" 0
 assert_contains "$OUT" "the version running now does not pass the health gate"
@@ -543,7 +551,8 @@ teardown
 setup "fresh data: a stale value fails the deploy; a far-future value fails too"
 echo 'ok {"a":"2026-01-01T00:00:00Z","f":"2099-01-01T00:00:00Z"}' >"$STUB_STATE/health"
 run_deploy DL_HEALTH_JQ= "DL_HEALTH_FRESH='.a 300'" DL_HEALTH_TIMEOUT=0 DL_TAG_PUSH=0
-assert_eq "$RC" 2 "(stale everywhere, rollback also stale)"
+assert_eq "$RC" 1 "(the running version was stale before the deploy too, so its rollback is judged by liveness)"
+assert_contains "$OUT" "judging the rollback by liveness (http://box/health)"
 run_deploy DL_HEALTH_JQ= "DL_HEALTH_FRESH='.f 300'" DL_HEALTH_TIMEOUT=0 DL_TAG_PUSH=0
 assert_contains "$OUT" "fresh .f is in the future"
 teardown
@@ -589,19 +598,19 @@ assert_eq "$RC" 3
 assert_not_contains "$CALLS" "compose up"
 teardown
 
-setup "if the files cannot be restored the images are still rolled back, and it says so"
+setup "if the files cannot be restored the images are still rolled back, and it says so (5)"
 printf 'fail\nok {"ok":true}\n' >"$STUB_STATE/health"
 run_deploy "dl_sync() { rm -f '$T'/boxstate/snapshot-*.tgz; }" DL_HEALTH_TIMEOUT=0
-assert_eq "$RC" 1 "$OUT"
+assert_eq "$RC" 5 "$OUT"
 assert_contains "$OUT" "compose directory was not restored"
 assert_contains "$CALLS" "--no-build --force-recreate web"
 teardown
 
-setup "a service with no rollback point that stays on the new build makes it exit 2"
+setup "a service with no rollback point that stays on the new build makes it exit 5"
 printf 'web\nworker\n' >"$STUB_STATE/services"; echo hub-worker >"$STUB_STATE/images/worker"
 printf 'fail\nok {"ok":true}\n' >"$STUB_STATE/health"
 run_deploy DL_HEALTH_TIMEOUT=0
-assert_eq "$RC" 2 "$OUT"
+assert_eq "$RC" 5 "$OUT"
 assert_contains "$OUT" "still run the new build: worker"
 teardown
 
@@ -665,7 +674,7 @@ rm -f "$STUB_STATE/curl_count"
 # The new build never comes up: the old container keeps answering with the old commit.
 run_deploy DL_HEALTH_COMMIT=.commit DL_HEALTH_TIMEOUT=0
 assert_eq "$RC" 1 "$OUT"
-assert_contains "$OUT" "rolled back and the old version is healthy"
+assert_contains "$OUT" "rolled back, and the old version passes the full health gate"
 assert_not_contains "$OUT" "does not pass the health gate"
 teardown
 
@@ -735,25 +744,27 @@ assert_not_contains "$OUT" "the app says"
 teardown
 
 # ------------------------------------------------ dl_health_extra (2.1.0)
+# These hooks count their calls after the restart; the probe of the version
+# running before the deploy (DL_PROBE=pre) runs them too, so they skip it.
 
 setup "dl_health_extra runs after the JSON passes, with the body and the commit"
-run_deploy DL_TAG_PUSH=0 "dl_health_extra() { printf '%s|%s\n' \"\$1\" \"\$DL_FULL_SHA\" >>'$T/hook'; }"
+run_deploy DL_TAG_PUSH=0 "dl_health_extra() { [ \"\${DL_PROBE:-}\" = pre ] && return 0; printf '%s|%s\n' \"\$1\" \"\$DL_FULL_SHA\" >>'$T/hook'; }"
 assert_eq "$RC" 0
 assert_eq "$(cat "$T/hook")" "{\"ok\":true}|$SHA" "(one call, body and deployed commit)"
 teardown
 
 setup "a failing dl_health_extra rolls back, and its output is the reason"
 run_deploy DL_HEALTH_TIMEOUT=0 DL_TAG_PUSH=0 \
-  "dl_health_extra() { n=\$(( \$(cat '$T/n' 2>/dev/null || echo 0) + 1 )); echo \$n >'$T/n'; [ \$n -gt 1 ] && return 0; echo noise; echo 'web published on 0.0.0.0' >&2; return 5; }"
+  "dl_health_extra() { [ \"\${DL_PROBE:-}\" = pre ] && return 0; n=\$(( \$(cat '$T/n' 2>/dev/null || echo 0) + 1 )); echo \$n >'$T/n'; [ \$n -gt 1 ] && return 0; echo noise; echo 'web published on 0.0.0.0' >&2; return 5; }"
 assert_eq "$RC" 1
 assert_contains "$OUT" "dl_health_extra failed (exit 5): noise web published on 0.0.0.0"
 assert_contains "$CALLS" "docker compose up -d --no-build --force-recreate web"
-assert_contains "$OUT" "rolled back and the old version is healthy"
+assert_contains "$OUT" "rolled back, and the old version passes the full health gate"
 teardown
 
 setup "dl_health_extra is not run while the JSON gate fails"
 printf 'ok {"ok":false}\nok {"ok":true}\n' >"$STUB_STATE/health"
-run_deploy DL_HEALTH_TIMEOUT=5 DL_TAG_PUSH=0 "dl_health_extra() { echo x >>'$T/hook'; }"
+run_deploy DL_HEALTH_TIMEOUT=5 DL_TAG_PUSH=0 "dl_health_extra() { [ \"\${DL_PROBE:-}\" = pre ] && return 0; echo x >>'$T/hook'; }"
 assert_eq "$RC" 0
 assert_eq "$(wc -l <"$T/hook" | tr -d ' ')" "1" "(only the probe whose JSON passed ran the hook)"
 teardown
@@ -767,7 +778,7 @@ teardown
 
 setup "the settle recheck runs dl_health_extra again"
 run_deploy DL_TAG_PUSH=0 DL_HEALTH_SETTLE=0.1 \
-  "dl_health_extra() { n=\$(( \$(cat '$T/n' 2>/dev/null || echo 0) + 1 )); echo \$n >'$T/n'; [ \$n -lt 2 ] || [ \$n -gt 2 ]; }"
+  "dl_health_extra() { [ \"\${DL_PROBE:-}\" = pre ] && return 0; n=\$(( \$(cat '$T/n' 2>/dev/null || echo 0) + 1 )); echo \$n >'$T/n'; [ \$n -lt 2 ] || [ \$n -gt 2 ]; }"
 assert_eq "$RC" 1 "(healthy once, the hook failed on the settle check, rollback healthy)"
 assert_contains "$OUT" "healthy once, then not healthy"
 teardown
@@ -791,6 +802,200 @@ git -C "$T/repo" add hook.conf; git -C "$T/repo" commit -qm hook
 OUT=$(PATH="$HERE/stubs:$PATH" bash "$HERE/../../deploy/homelab-deploy" "$T/repo/hook.conf" --health 2>&1); RC=$?
 assert_eq "$RC" 1 "$OUT"
 assert_contains "$OUT" "not healthy: dl_health_extra failed (exit 1): board did not paint"
+teardown
+
+# ------------------------------------------------ judging a rollback (2.2.0)
+
+# The exact 2026-09-23 family-hub sequence: the hub running before the
+# deploy has no deploy record, so the new gate's .config.matches_deploy is
+# false for it and always will be; the new build fails the gate; the
+# rollback puts the old hub back, up and serving. It must be judged by
+# liveness, report exit 1 with that gate named, never say DOWN, and not sit
+# out the timeout waiting for a gate the old version can never pass.
+setup "a version without a deploy record: failed deploy, rollback judged by liveness, exit 1, no DOWN, no long wait"
+old_body='ok {"status":"ok","config":{"matches_deploy":false}}'
+echo "$old_body" >"$STUB_STATE/health_pre"
+echo "$old_body" >"$STUB_STATE/health"   # the new build fails too, and so would the old one, forever
+[[ ! -e "$T/boxstate/deployed-sha" ]] && ok || fail "the box must start with no deploy record"
+t0=$SECONDS
+run_deploy DL_HEALTH_JQ= "DL_HEALTH_REQUIRE='.config.matches_deploy'" DL_LIVENESS_URL=http://box/live \
+  DL_HEALTH_TIMEOUT=3 DL_HEALTH_INTERVAL=0.2
+elapsed=$(( SECONDS - t0 ))
+assert_eq "$RC" 1 "$OUT"
+assert_contains "$OUT" "the version running now does not pass the health gate: required .config.matches_deploy is missing or false"
+assert_contains "$OUT" "so if this deploy fails, its rollback is judged by liveness (http://box/live)"
+assert_contains "$OUT" "not healthy after 3s"
+assert_contains "$OUT" "judging the rollback by liveness (http://box/live)"
+assert_contains "$OUT" "healthy after 1 check(s): liveness (http://box/live)"
+assert_contains "$OUT" "rolled back, and the old version passes liveness (http://box/live)"
+assert_not_contains "$OUT" "SERVICE IS DOWN"
+assert_not_contains "$OUT" "ROLLBACK FAILED"
+assert_contains "$CALLS" "docker compose up -d --no-build --force-recreate web"
+(( elapsed < 6 )) && ok || fail "the whole run took ${elapsed}s: the rollback waited out a gate it could never pass"
+log=$(cat "$T/boxstate/deploys.log")
+assert_contains "$log" "failed-deploy sha=$SHA prev=none"
+assert_contains "$log" "judged-by=live"
+assert_contains "$log" "result=rolled-back rc=1"
+[[ ! -e "$T/boxstate/deployed-sha" ]] && ok || fail "a failed deploy must not write a deploy record"
+teardown
+
+setup "the same sequence where the old version does not come back: liveness fails, DOWN, exit 2"
+echo 'ok {"status":"ok","config":{"matches_deploy":false}}' >"$STUB_STATE/health_pre"
+echo fail >"$STUB_STATE/health"
+echo fail >"$STUB_STATE/live"
+run_deploy DL_HEALTH_JQ= "DL_HEALTH_REQUIRE='.config.matches_deploy'" DL_LIVENESS_URL=http://box/live DL_HEALTH_TIMEOUT=0
+assert_eq "$RC" 2 "$OUT"
+assert_contains "$OUT" "ROLLBACK FAILED. SERVICE IS DOWN: liveness http://box/live: request failed"
+assert_contains "$OUT" "Run this by hand, then check http://box/live"
+assert_contains "$OUT" "docker tag hub-web:$PRE hub-web:latest"
+assert_contains "$(cat "$T/boxstate/deploys.log")" "result=down rc=2"
+teardown
+
+setup "a running version that passed the full gate is held to it; failing it but answering is 5, not DOWN"
+echo 'ok {"ok":false}' >"$STUB_STATE/health"
+run_deploy DL_LIVENESS_URL=http://box/live DL_HEALTH_TIMEOUT=0 DL_TAG_PUSH=0
+assert_eq "$RC" 5 "$OUT"
+assert_contains "$OUT" "passes the full health gate, so a rollback must pass it again"
+assert_contains "$OUT" "judging the rollback by the full health gate (http://box/health)"
+assert_contains "$OUT" "ROLLED BACK and the old version is UP (liveness http://box/live answers), but it does not pass the full health gate"
+assert_not_contains "$OUT" "SERVICE IS DOWN"
+assert_contains "$(cat "$T/boxstate/deploys.log")" "judged-by=full"
+teardown
+
+setup "full gate, old version fails it and liveness too: DOWN, exit 2"
+echo fail >"$STUB_STATE/health"; echo fail >"$STUB_STATE/live"
+run_deploy DL_LIVENESS_URL=http://box/live DL_HEALTH_TIMEOUT=0 DL_TAG_PUSH=0
+assert_eq "$RC" 2 "$OUT"
+assert_contains "$OUT" "SERVICE IS DOWN"
+assert_not_contains "$OUT" "it did not answer liveness before this deploy either"
+teardown
+
+setup "without DL_LIVENESS_URL, liveness is the health URL answering at all"
+echo 'ok {"ok":false}' >"$STUB_STATE/health_pre"
+echo 'ok {"ok":false}' >"$STUB_STATE/health"
+run_deploy DL_HEALTH_TIMEOUT=0 DL_TAG_PUSH=0
+assert_eq "$RC" 1 "$OUT"
+assert_contains "$OUT" "passes liveness (http://box/health)"
+teardown
+
+setup "a running version that also failed liveness: the rollback is still judged by liveness, and says so if it stays down"
+echo fail >"$STUB_STATE/live_pre"; echo fail >"$STUB_STATE/live"
+rm "$STUB_STATE/health_pre"; echo fail >"$STUB_STATE/health"
+run_deploy DL_LIVENESS_URL=http://box/live DL_HEALTH_TIMEOUT=0 DL_TAG_PUSH=0
+assert_eq "$RC" 2 "$OUT"
+assert_contains "$OUT" "it does not answer liveness either"
+assert_contains "$OUT" "(it did not answer liveness before this deploy either)"
+teardown
+
+setup "the old version passed the JSON gate but not dl_health_extra: the rollback is judged by the JSON gate alone"
+run_deploy DL_HEALTH_TIMEOUT=0 DL_TAG_PUSH=0 \
+  "dl_health_extra() { echo \"\${DL_PROBE:-post}\" >>'$T/hook'; echo 'wyze-bridge exited'; return 1; }"
+assert_eq "$RC" 1 "$OUT"
+assert_contains "$OUT" "the version running now does not pass the health gate: dl_health_extra failed (exit 1): wyze-bridge exited"
+assert_contains "$OUT" "judging the rollback by the health gate without dl_health_extra (http://box/health)"
+assert_eq "$(tr '\n' ' ' <"$T/hook")" "pre post " "(the hook ran for the pre probe and the new build, never for the rollback)"
+teardown
+
+setup "the old version failed the JSON gate but passed dl_health_extra: the rollback must pass liveness AND the hook"
+echo 'ok {"ok":false}' >"$STUB_STATE/health_pre"
+echo 'ok {"ok":false}' >"$STUB_STATE/health"
+run_deploy DL_LIVENESS_URL=http://box/live DL_HEALTH_TIMEOUT=0 DL_TAG_PUSH=0 \
+  "dl_health_extra() { [ \"\${DL_PROBE:-}\" = pre ] && return 0; [ \"\$1\" = '' ] || { echo \"body passed: \$1\"; return 1; }; echo 'go2rtc: is exited'; return 1; }"
+assert_eq "$RC" 5 "$OUT"
+assert_contains "$OUT" "its rollback is judged by liveness (http://box/live) plus dl_health_extra"
+assert_contains "$OUT" "go2rtc: is exited"
+assert_contains "$OUT" "ROLLED BACK and the old version is UP"
+assert_not_contains "$OUT" "body passed"
+teardown
+
+setup "no rollback point and the new build still answers: 5, not DOWN"
+rm "$STUB_STATE/ps/web"
+echo 'ok {"ok":false}' >"$STUB_STATE/health"
+run_deploy DL_HEALTH_TIMEOUT=0 DL_TAG_PUSH=0
+assert_eq "$RC" 5 "$OUT"
+assert_contains "$OUT" "the NEW build still runs and failed the gate"
+assert_not_contains "$OUT" "SERVICE IS DOWN"
+teardown
+
+setup "a rollback whose docker compose fails: 5 when something answers, 2 when nothing does"
+echo 1 >"$STUB_STATE/up_rc_2"
+echo fail >"$STUB_STATE/health"
+run_deploy DL_LIVENESS_URL=http://box/live DL_HEALTH_TIMEOUT=0 DL_TAG_PUSH=0
+assert_eq "$RC" 5 "$OUT"
+assert_contains "$OUT" "the rollback did not complete (above), but something answers liveness"
+rm -f "$STUB_STATE/up_count"; echo fail >"$STUB_STATE/live"
+run_deploy DL_LIVENESS_URL=http://box/live DL_HEALTH_TIMEOUT=0 DL_TAG_PUSH=0
+assert_eq "$RC" 2 "$OUT"
+assert_contains "$OUT" "ROLLBACK FAILED and liveness does not answer"
+teardown
+
+setup "a dl_sync failure with no snapshot to put back is 5: nothing restarted, files half-synced"
+run_deploy DL_SNAPSHOT=0 "dl_sync() { return 1; }"
+assert_eq "$RC" 5 "$OUT"
+assert_contains "$OUT" "dl_sync's changes are still in"
+teardown
+
+# ------------------------------------------------ deploys.log and tag privacy (2.2.0)
+
+setup "a healthy deploy is written to deploys.log on the box"
+run_deploy
+assert_eq "$RC" 0 "$OUT"
+assert_contains "$(cat "$T/boxstate/deploys.log")" "hub deployed sha=$SHA prev=none images=pre-"
+teardown
+
+setup "DL_TAG_PUSH=local creates the tags in the clone and never pushes them"
+run_deploy DL_TAG_PUSH=local
+assert_eq "$RC" 0 "$OUT"
+assert_contains "$(git -C "$T/repo" tag -l 'deploy/hub/*')" "deploy/hub/"
+assert_eq "$(git -C "$T/origin.git" tag -l)" "" "(nothing pushed)"
+assert_contains "$OUT" "DL_TAG_PUSH=local never pushes it"
+echo fail >"$STUB_STATE/health"
+run_deploy DL_TAG_PUSH=local DL_HEALTH_TIMEOUT=0
+assert_contains "$(git -C "$T/repo" tag -l 'failed-deploy/hub/*')" "failed-deploy/hub/"
+assert_contains "$(git -C "$T/repo" tag -l 'rollback-point/hub/*')" "rollback-point/hub/"
+assert_eq "$(git -C "$T/origin.git" tag -l)" "" "(still nothing pushed)"
+teardown
+
+setup "a PUBLIC GitHub remote refuses to push deploy tags, before anything changes"
+git -C "$T/repo" remote set-url origin https://github.com/someone/public-app.git
+echo false >"$STUB_STATE/gh_private"
+run_deploy
+assert_eq "$RC" 3 "$OUT"
+assert_contains "$OUT" "someone/public-app is PUBLIC"
+assert_contains "$CALLS" "gh api repos/someone/public-app --jq .private"
+assert_not_contains "$CALLS" "docker"
+run_deploy DL_TAG_PUSH=local
+assert_eq "$RC" 0 "(local tags are fine) $OUT"
+run_deploy DL_TAG_PUSH_PUBLIC=1
+assert_eq "$RC" 4 "(allowed on purpose; the push itself fails, there is no GitHub here)"
+teardown
+
+setup "a private GitHub remote is allowed; an unknown answer or a gh failure is refused"
+git -C "$T/repo" remote set-url origin git@github.com:someone/private-app.git
+echo true >"$STUB_STATE/gh_private"
+run_deploy
+assert_eq "$RC" 4 "(the check lets it through; the push fails with no GitHub here) $OUT"
+assert_contains "$CALLS" "gh api repos/someone/private-app --jq .private"
+touch "$STUB_STATE/gh_fail"; : >"$STUB_STATE/calls"
+run_deploy
+assert_eq "$RC" 3 "$OUT"
+assert_contains "$OUT" "cannot tell whether someone/private-app is private"
+assert_not_contains "$(cat "$STUB_STATE/calls")" "docker"
+rm "$STUB_STATE/gh_fail"; echo null >"$STUB_STATE/gh_private"
+run_deploy
+assert_eq "$RC" 3 "$OUT"
+teardown
+
+setup "another host must be declared private; a bad DL_TAG_PUSH is a config error"
+git -C "$T/repo" remote set-url origin https://gitlab.example.com/x/y.git
+run_deploy
+assert_eq "$RC" 3 "$OUT"
+assert_contains "$OUT" "Set DL_TAG_REMOTE_PRIVATE=1 if it is"
+run_deploy DL_TAG_REMOTE_PRIVATE=1
+assert_eq "$RC" 4 "(declared private; the push fails with no such host) $OUT"
+run_deploy DL_TAG_PUSH=yes
+assert_eq "$RC" 3 "$OUT"
+assert_contains "$OUT" "DL_TAG_PUSH must be 1, local or 0"
 teardown
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
