@@ -1,12 +1,23 @@
 #!/usr/bin/env bash
 # Fake docker for deploy-lib tests. State lives in $STUB_STATE:
 #   services                 output of "compose config --services"
-#   images/<svc>             output of "compose config --images <svc>"
+#   images/<svc>             the service's image: key. Missing or empty = a
+#                            build-only service (no image: key, a build: key).
+#   deps/<svc>               services <svc> depends_on, one per line. Real
+#                            "compose config --images <svc>" lists THEIR images
+#                            too, and this stub lists them FIRST (the order
+#                            that tagged house-climate's web image as the db
+#                            image on 2026-09-23).
+#   project                  compose project name (default "hub")
+#   config_json              if present, printed as-is for "config --format json"
+#   json_rc                  exit code for "config --format json" (default 0)
 #   ps/<svc>                 container id for "compose ps -q <svc>"
 #   inspect/<cid>            image id of a container
 #   tags/<ref with / and : as _>  image id a tag points at
 #   up_rc                    exit code for "compose up" (default 0); up_rc_2 for the 2nd up, etc.
 #   fail_config              if present, "compose config" fails
+#   fail_image_ls            if present, "image ls" fails
+#   fail_rmi                 if present, "rmi" fails
 set -u
 S="$STUB_STATE"
 printf 'docker %s\n' "$*" >>"$S/calls"
@@ -20,7 +31,37 @@ if [[ "${args[0]}" == compose ]]; then
     config)
       [[ -e "$S/fail_config" ]] && { echo "config broken" >&2; exit 1; }
       if [[ "${args[1]}" == --services ]]; then cat "$S/services"; exit 0; fi
-      if [[ "${args[1]}" == --images ]]; then cat "$S/images/${args[2]}"; exit 0; fi
+      if [[ "${args[1]}" == --images ]]; then
+        svc="${args[2]}"
+        if [[ -f "$S/deps/$svc" ]]; then
+          while IFS= read -r dep; do
+            [[ -s "$S/images/$dep" ]] && cat "$S/images/$dep"
+          done <"$S/deps/$svc"
+        fi
+        if [[ -s "$S/images/$svc" ]]; then cat "$S/images/$svc"; else printf '%s-%s\n' "$(cat "$S/project" 2>/dev/null || echo hub)" "$svc"; fi
+        exit 0
+      fi
+      json=0
+      for a in "${args[@]}"; do [[ "$a" == json ]] && json=1; done
+      if [[ $json == 1 ]]; then
+        rc=$(cat "$S/json_rc" 2>/dev/null || echo 0)
+        [[ "$rc" == 0 ]] || { echo "compose config: json failed" >&2; exit "$rc"; }
+        [[ -f "$S/config_json" ]] && { cat "$S/config_json"; exit 0; }
+        # Every service (real compose prints the named ones plus what they
+        # depend on; a superset is what the library must cope with anyway).
+        # A build-only service has build: and no image:, as real compose prints it.
+        out='{}'
+        while IFS= read -r svc; do
+          [[ -n "$svc" ]] || continue
+          image=$(cat "$S/images/$svc" 2>/dev/null || true)
+          deps=$(cat "$S/deps/$svc" 2>/dev/null || true)
+          out=$(jq -c --arg s "$svc" --arg i "$image" --arg d "$deps" '
+            .services[$s] = ((if $i == "" then {build: {context: "."}} else {image: $i} end)
+              + (if $d == "" then {} else {depends_on: ($d | split("\n") | map(select(. != "")) | map({(.): {condition: "service_started"}}) | add)} end))' <<<"$out")
+        done <"$S/services"
+        jq --arg p "$(cat "$S/project" 2>/dev/null || echo hub)" '{name: $p} + .' <<<"$out"
+        exit 0
+      fi
       exit 0 ;;
     ps)
       svc="${args[2]}"; [[ -f "$S/ps/$svc" ]] && cat "$S/ps/$svc"; exit 0 ;;
@@ -33,12 +74,14 @@ if [[ "${args[0]}" == compose ]]; then
 fi
 case "${args[0]}" in
   rmi)
+    [[ -e "$S/fail_rmi" ]] && { echo "Error response from daemon: conflict: unable to remove repository reference" >&2; exit 1; }
     rm -f "$S/tags/$(key "${args[1]}")"; exit 0 ;;
   inspect)
     cid="${args[3]}"; [[ -f "$S/inspect/$cid" ]] || exit 1; cat "$S/inspect/$cid"; exit 0 ;;
   image)
     if [[ "${args[1]}" == ls ]]; then
       # image ls --format '{{.Tag}}' <repo>: every tag stored for that repo.
+      [[ -e "$S/fail_image_ls" ]] && { echo "Cannot connect to the Docker daemon" >&2; exit 1; }
       prefix="$(key "${args[4]}")_"
       for f in "$S/tags/$prefix"*; do [[ -e "$f" ]] && printf '%s\n' "${f##*/"$prefix"}"; done
       exit 0

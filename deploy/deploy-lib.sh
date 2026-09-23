@@ -1,7 +1,7 @@
 # shellcheck shell=bash
 # deploy-lib.sh: shared homelab docker compose deploy with a real health gate
 # and automatic rollback. Canonical source: drench44/ci-policy deploy/deploy-lib.sh
-DL_LIB_VERSION="2.2.0"
+DL_LIB_VERSION="2.2.1"
 #
 # Most repos should not source this directly: write a small config file and
 # run deploy/homelab-deploy <config> (see deploy/example.deploy.conf).
@@ -18,8 +18,10 @@ DL_LIB_VERSION="2.2.0"
 #   1. Preflight: settings complete, tools present, git tree clean, health
 #      gate not shallow.
 #   2. Rollback point: tag each service's running image
-#      <image>:pre-<UTC time>-<sha> (<sha> = the commit being deployed; the
-#      newest DL_SNAPSHOT_KEEP such tags are kept), snapshot the compose directory
+#      <image>:pre-<UTC time>-<sha> (<image> = that service's own image:,
+#      or <project>-<service> when it only has build:; <sha> = the commit
+#      being deployed; after a healthy deploy the newest DL_SNAPSHOT_KEEP
+#      such tags per image are kept), snapshot the compose directory
 #      to a tarball on the box, and create + push git tag
 #      rollback-point/<service>/<UTC time> on the commit that was running
 #      (read from the box's state file). Git now records what to go back to.
@@ -112,7 +114,9 @@ DL_LIB_VERSION="2.2.0"
 #                       it on rollback. Files dl_sync ADDS are left in place.
 #   DL_SNAPSHOT_EXCLUDE paths (tar --exclude patterns) left out of the snapshot,
 #                       e.g. "./data ./photos". Keep big data out.
-#   DL_SNAPSHOT_KEEP    snapshots kept per service. Default 5.
+#   DL_SNAPSHOT_KEEP    snapshots kept per service, and pre-<stamp>-<sha> image
+#                       tags kept per image repo (pruned after a healthy
+#                       deploy). Default 5.
 #   DL_STATE_DIR        state dir on the box. Default
 #                       $HOME/.local/state/homelab-deploy/<service> (box's $HOME).
 #   DL_GIT_DIR          repo being deployed. Default: current directory.
@@ -234,12 +238,36 @@ _dl_split_image() {
   printf '%s %s\n' "$repo" "$tag"
 }
 
-# The image name compose runs for a service (from the compose config).
+# The image name compose runs for a service: the image: key of that service's
+# own entry in the compose config, or, for a build-only service, the name
+# compose gives the image it builds, <project>-<service>. Prints the reason
+# and returns 1 when there is no single answer.
+#
+# Never `config --images <svc>`: it also lists the images of the services
+# <svc> depends_on, in no set order. On 2026-09-23 it answered house-climate's
+# web with the database image first, so the running WEB image was tagged
+# timescale/timescaledb:pre-..., and a rollback would have retagged the
+# database's image name onto the old web image.
+# --no-env-resolution keeps env_file values (secrets) out of the output.
 dl_image_for() {
-  local svc="$1" out
-  out=$(dl_compose config --images "$svc") || return 1
-  out=$(printf '%s\n' "$out" | head -n 1)
-  [[ -n "$out" ]] || return 1
+  local svc="$1" json out
+  json=$(dl_compose config --no-env-resolution --format json "$svc") \
+    || { printf 'docker compose config --format json %s failed' "$svc"; return 1; }
+  # shellcheck disable=SC2016  # a jq program; $s and $c are jq variables
+  if ! out=$(printf '%s' "$json" | jq -r --arg s "$svc" '
+      (.services // {})[$s] as $c
+      | if $c == null then "ERROR: the compose config has no service \($s)"
+        elif ($c.image | type) == "string" and $c.image != "" then $c.image
+        elif $c.build != null and (.name | type) == "string" and .name != "" then "\(.name)-\($s)"
+        else "ERROR: service \($s) has neither an image nor a build (or the config has no project name)" end' 2>&1); then
+    printf 'the compose config for %s is not the JSON expected: %s' "$svc" "${out:0:200}"
+    return 1
+  fi
+  if [[ "$out" == ERROR:* ]]; then printf '%s' "${out#ERROR: }"; return 1; fi
+  if [[ -z "$out" || "$out" == *$'\n'* || "$out" == *[[:space:]]* ]]; then
+    printf 'the compose config gave %s no single image name (got "%s")' "$svc" "${out:0:200}"
+    return 1
+  fi
   printf '%s\n' "$out"
 }
 
@@ -456,7 +484,7 @@ dl_record_pre() {
   local svc image id repo tag services
   services=$(dl_services) || { dl_err "could not list compose services"; return 1; }
   for svc in $services; do
-    image=$(dl_image_for "$svc") || { dl_err "could not read the image name for $svc"; return 1; }
+    image=$(dl_image_for "$svc") || { dl_err "could not read the image name for $svc: $image"; return 1; }
     read -r repo tag <<<"$(_dl_split_image "$image")"
     id=$(dl_running_image_id "$svc") || { dl_err "could not inspect $svc"; return 1; }
     if [[ -z "$id" ]]; then
@@ -472,19 +500,38 @@ dl_record_pre() {
   return 0
 }
 
-# Keep only the newest DL_SNAPSHOT_KEEP pre- tags per image. Best effort.
+# Keep only the newest DL_SNAPSHOT_KEEP pre- tags per image repo, counting
+# the one this run made. Runs only after a healthy deploy. Best effort: a
+# failure is a warning, never a failed deploy.
+#   - Only tags this library writes, exactly pre-<YYYYMMDDTHHMMSSZ>-<12 hex>.
+#     Hand-made tags (pre-port-abc, pre-radar-v4) are never touched.
+#   - Never the tag this run made (it is the rollback point just printed).
+#   - Newest by the UTC stamp in the name, so the order is the deploy order.
+#   - Per repo: two stacks that deploy the same image share its count.
+#   - docker rmi of a tag only drops the name while another tag or a
+#     container still uses the image; the image goes when nothing does.
 dl_prune_pre_tags() {
-  local keep="${DL_SNAPSHOT_KEEP:-5}" svc repo tag old
+  local keep="${DL_SNAPSHOT_KEEP:-5}" svc repo tag old tags seen=" " pruned
   while read -r svc repo tag; do
     [[ -n "$svc" ]] || continue
+    # Two services on one image repo: prune it once.
+    [[ "$seen" == *" $repo "* ]] && continue
+    seen+="$repo "
+    if ! tags=$(dl_docker image ls --format '{{.Tag}}' "$repo" </dev/null); then
+      dl_warn "could not list the tags of $repo, so its old pre- tags were not pruned"
+      continue
+    fi
+    pruned=$(printf '%s\n' "$tags" \
+      | grep -E '^pre-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12}$' | grep -vxF "$DL_PRE_TAG" \
+      | LC_ALL=C sort -r | tail -n +"$keep") || true
     while IFS= read -r old; do
       [[ -n "$old" ]] || continue
-      dl_docker rmi "$repo:$old" </dev/null >/dev/null 2>&1 || dl_warn "could not remove old tag $repo:$old"
-    # Only tags this library wrote (pre-<UTC stamp>-<sha>); hand-made tags
-    # such as pre-port-abc stay. Never the one this run just made.
-    done < <(dl_docker image ls --format '{{.Tag}}' "$repo" </dev/null 2>/dev/null \
-               | grep -E '^pre-[0-9]{8}T[0-9]{6}Z-[0-9a-f]+$' | grep -vx "$DL_PRE_TAG" \
-               | sort -r | tail -n +"$keep")
+      if dl_docker rmi "$repo:$old" </dev/null >/dev/null; then
+        dl_log "pruned old rollback tag $repo:$old (keeping the newest $keep)"
+      else
+        dl_warn "could not remove old tag $repo:$old"
+      fi
+    done <<<"$pruned"
   done <<<"${DL_PRE:-}"
   return 0
 }
