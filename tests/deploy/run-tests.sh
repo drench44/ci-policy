@@ -708,7 +708,7 @@ echo db >"$STUB_STATE/deps/web"; echo db >"$STUB_STATE/deps/poller"
 echo c-poller >"$STUB_STATE/ps/poller"; echo sha256:OLDPOLLER >"$STUB_STATE/inspect/c-poller"
 echo sha256:DBID >"$STUB_STATE/tags/timescale_timescaledb_2.29.1-pg16"
 # The trap is real: the old way reads the db image first.
-first=$(PATH="$HERE/stubs:$PATH" docker compose config --images web | head -n 1)
+first=$(PATH="$HERE/stubs:$PATH" docker compose config --images web | sed -n 1p)
 assert_eq "$first" "timescale/timescaledb:2.29.1-pg16" "(stub lists the dependency first)"
 : >"$STUB_STATE/calls"
 printf 'fail\nok {"ok":true}\n' >"$STUB_STATE/health"
@@ -786,7 +786,7 @@ teardown
 setup "pruning keeps the newest DL_SNAPSHOT_KEEP per repo, this run's included, and only exact library tags"
 for t in pre-20260101T000000Z-aaaaaaaaaaaa pre-20260102T000000Z-bbbbbbbbbbbb pre-20260103T000000Z-cccccccccccc \
          pre-20260104T000000Z-dddddddddddd pre-20260105T000000Z-eeeeeeeeeeee \
-         pre-20260101T000000Z-abc pre-20260101T000000Z-aaaaaaaaaaaaff pre-20260101T000000Z-AAAAAAAAAAAA \
+         pre-20260101T000000Z-abc pre-20260101T000000Z-aaaaaaaaaaaaff pre-20260101T000000Z-gggggggggggg \
          pre-20260101T0000Z-aaaaaaaaaaaa xpre-20260101T000000Z-aaaaaaaaaaaa pre-port-edd52cd 1.0; do
   echo sha256:X >"$STUB_STATE/tags/hub-web_$t"
 done
@@ -801,7 +801,7 @@ for gone in 20260101T000000Z-aaaaaaaaaaaa 20260102T000000Z-bbbbbbbbbbbb 20260103
   assert_contains "$OUT" "pruned old rollback tag hub-web:pre-$gone"
 done
 # Not this library's exact shape: never touched.
-for kept in pre-20260101T000000Z-abc pre-20260101T000000Z-aaaaaaaaaaaaff pre-20260101T000000Z-AAAAAAAAAAAA \
+for kept in pre-20260101T000000Z-abc pre-20260101T000000Z-aaaaaaaaaaaaff pre-20260101T000000Z-gggggggggggg \
             pre-20260101T0000Z-aaaaaaaaaaaa xpre-20260101T000000Z-aaaaaaaaaaaa pre-port-edd52cd 1.0; do
   assert_contains "$left" "hub-web_$kept "
 done
