@@ -39,6 +39,9 @@ EXPIRY_WARN_DAYS = 14
 class Watched:
     repo: str
     branch: str
+    # When the repo's main-watch caller merged: earlier pushes had nothing to
+    # conclude on them.
+    since: dt.datetime
     workflow: str = DEFAULT_WORKFLOW
 
 
@@ -76,7 +79,11 @@ def load_repos(path: str) -> List[Watched]:
         workflow = cfg.get("workflow", DEFAULT_WORKFLOW)
         if not isinstance(workflow, str) or not workflow.startswith(".github/workflows/"):
             raise ValueError(f"{path}: {name} `workflow` must be a .github/workflows/ path")
-        out.append(Watched(name, cfg["branch"], workflow))
+        since = parse_time(cfg.get("since")) if isinstance(cfg.get("since"), str) else None
+        if since is None or since.tzinfo is None:
+            raise ValueError(f"{path}: {name} needs `since`, the UTC time its main-watch caller "
+                             "merged (for example 2026-09-23T14:43:00Z)")
+        out.append(Watched(name, cfg["branch"], since, workflow))
     return out
 
 
@@ -154,7 +161,7 @@ def check_push(api: gh.GitHub, w: Watched, a: dict, age: dt.timedelta) -> List[P
 def audit_repo(api: gh.GitHub, w: Watched, now: dt.datetime, grace_hours: float,
                lookback_hours: float) -> RepoReport:
     report = RepoReport(w.repo)
-    oldest = now - dt.timedelta(hours=lookback_hours)
+    oldest = max(now - dt.timedelta(hours=lookback_hours), w.since)
     newest = now - dt.timedelta(hours=grace_hours)
     try:
         activity = api.paginate(f"/repos/{w.repo}/activity",

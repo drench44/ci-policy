@@ -32,7 +32,7 @@ def wf_runs(*runs):
                                     "run_attempt": 1}, **r) for i, r in enumerate(runs, 1)]}
 
 
-W = Watched("drench44/demo", "main")
+W = Watched("drench44/demo", "main", NOW - dt.timedelta(days=30))
 
 
 class AuditRepoTests(unittest.TestCase):
@@ -127,6 +127,14 @@ class AuditRepoTests(unittest.TestCase):
         self.assertIn("re-check is not running", p.text)
         self.assertIn("PR #5: waiting", p.text)
 
+    def test_pushes_before_main_watch_existed_are_skipped(self):
+        # Seen on the first dry run: every push from before the rollout had no
+        # main-watch run, and would have flooded the first issue.
+        w = Watched("drench44/demo", "main", NOW - dt.timedelta(hours=10))
+        r = audit_repo(FakeGitHub({f"GET {R}/activity": [push(S1, 11), push(S2, 30)]}),
+                       w, NOW, 6, 72)
+        self.assertEqual((r.checked, r.problems), (0, []))
+
     def test_window_skips_fresh_and_old_pushes(self):
         routes = {f"GET {R}/activity": [push(S1, 1), push(S2, 100)]}
         r = self.run_audit(routes)
@@ -181,11 +189,17 @@ class LoadReposTests(unittest.TestCase):
         self.assertEqual(by["drench44/fleet-dashboard"].branch, "master")
         self.assertEqual(by["drench44/ci-policy"].workflow, ".github/workflows/policy.yml")
         self.assertIn("drench44/cpapclarity", by)
+        # Every watched repo says when its main-watch started.
+        self.assertTrue(all(w.since.tzinfo for w in repos))
 
     def test_bad_files(self):
-        for data in [{}, {"repos": {}}, {"repos": {"nope": {"branch": "main"}}},
+        ok = {"branch": "main", "since": "2026-09-23T14:43:00Z"}
+        for data in [{}, {"repos": {}}, {"repos": {"nope": ok}},
                      {"repos": {"a/b": {}}},
-                     {"repos": {"a/b": {"branch": "main", "workflow": "x.yml"}}}]:
+                     {"repos": {"a/b": dict(ok, workflow="x.yml")}},
+                     {"repos": {"a/b": {"branch": "main"}}},                       # no since
+                     {"repos": {"a/b": dict(ok, since="yesterday")}},
+                     {"repos": {"a/b": dict(ok, since="2026-09-23T14:43:00")}}]:  # no zone
             with self.subTest(data=data), self.assertRaises(ValueError):
                 self.load(data)
 
@@ -211,7 +225,8 @@ HOME = "/repos/drench44/ci-policy"
 class AuditMainTests(unittest.TestCase):
     def run_main(self, audit_routes, home_routes, inputs=None, token="pat", expiry=None):
         repos = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
-        json.dump({"repos": {"drench44/demo": {"branch": "main"}}}, repos)
+        json.dump({"repos": {"drench44/demo": {"branch": "main",
+                                               "since": "2026-08-01T00:00:00Z"}}}, repos)
         repos.close()
         home = FakeGitHub(home_routes)
         pat = FakeGitHub({"GET /rate_limit": {}, **audit_routes})

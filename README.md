@@ -137,7 +137,9 @@ started a run within the last 3 hours, and that its newest finished run
 succeeded.
 
 Add a repo to `policy/main-watch-repos.json` in the same change that gives it
-a main-watch caller.
+a main-watch caller, with `since` set to when that caller merged: pushes from
+before it had no main-watch to conclude on (the first dry run against the real
+repos flagged about 90 of them before this cutoff existed).
 
 ### The allowlist
 
