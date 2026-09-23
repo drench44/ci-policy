@@ -1,0 +1,70 @@
+# Reusable main-branch watchdog. Call it on push to the default branch; see
+# examples/main-watch.yml. Every new commit must come from a merged PR whose
+# head checks were green, or match policy/main-allowlist.json. Anything else,
+# and any force push or branch deletion, opens (or comments on) one issue
+# labeled main-watch, which GitHub emails to the repo owner. Alerts only; it
+# never reverts anything.
+name: main-watch
+
+on:
+  workflow_call:
+    inputs:
+      runs-on:
+        description: >-
+          JSON for runs-on. Private repos: '["self-hosted","omen"]'. Public
+          repos: '"ubuntu-latest"'.
+        type: string
+        default: '"ubuntu-latest"'
+      ci-policy-ref:
+        description: Ref of drench44/ci-policy to run. Keep it the same as the ref in `uses:`.
+        type: string
+        default: main
+      branch:
+        description: Branch to watch. Empty means the repo's default branch.
+        type: string
+        default: ""
+      allow-rules:
+        description: >-
+          Extra allow rules for this repo only, as JSON, same shape as the
+          entries in policy/main-allowlist.json. Prefer adding to that file.
+        type: string
+        default: ""
+      ignore-checks:
+        description: Check names (globs) to leave out when judging a PR head.
+        type: string
+        default: ""
+      fail-on-alert:
+        description: Also turn this run red when something is flagged.
+        type: string
+        default: "true"
+
+permissions:
+  contents: read
+  pull-requests: read
+  checks: read
+  statuses: read
+  issues: write
+
+jobs:
+  main-watch:
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
+    timeout-minutes: 5
+    steps:
+      - name: Check out ci-policy
+        uses: actions/checkout@v5
+        with:
+          repository: drench44/ci-policy
+          ref: ${{ inputs.ci-policy-ref }}
+          path: .ci-policy
+          persist-credentials: false
+      - name: Check the push
+        env:
+          PYTHONPATH: ${{ github.workspace }}/.ci-policy/lib
+          PYTHONDONTWRITEBYTECODE: "1"
+          INPUT_TOKEN: ${{ github.token }}
+          INPUT_BRANCH: ${{ inputs.branch }}
+          INPUT_ALLOWLIST_FILE: ${{ github.workspace }}/.ci-policy/policy/main-allowlist.json
+          INPUT_ALLOW_RULES: ${{ inputs.allow-rules }}
+          INPUT_IGNORE_CHECKS: ${{ inputs.ignore-checks }}
+          INPUT_FAIL_ON_ALERT: ${{ inputs.fail-on-alert }}
+        run: python3 -m ci_policy.main_watch

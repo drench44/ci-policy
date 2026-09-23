@@ -1,0 +1,26 @@
+# ci-policy dogfoods its own reusable workflows, from the commit under test.
+name: policy
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened, labeled, unlabeled, ready_for_review]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: read
+  checks: read
+  statuses: read
+  issues: write
+
+jobs:
+  pr-policy:
+    if: github.event_name == 'pull_request'
+    uses: ./.github/workflows/pr-policy.yml
+    with:
+      ci-policy-ref: ${{ github.event.pull_request.head.sha }}
+  main-watch:
+    if: github.event_name == 'push'
+    uses: ./.github/workflows/main-watch.yml
+    with:
+      ci-policy-ref: ${{ github.sha }}

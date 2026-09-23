@@ -1,0 +1,28 @@
+{
+  "about": "Commits allowed to reach a protected branch (main/master) without a PR. Read by main-watch (CI), the global git pre-push hook, and the Claude Code push guard. Found 2026-09-22 by reading every repo's scripts, workflows, timers and garage deploy units. A rule matches when the commit subject matches `subject` (Python regex), the branch matches `branch` (if set), and every changed file matches `paths` (if set). Keep rules narrow: subject AND paths wherever the automation's file set is known.",
+  "repos": {
+    "drench44/family-hub": [
+      {
+        "name": "release script (scripts/release.py, pushed by hand with git push --follow-tags)",
+        "branch": "main",
+        "subject": "^release: v\\d+\\.\\d+\\.\\d+$",
+        "paths": ["VERSION", "CHANGELOG.md", "src/family_hub/web/static/index.html"]
+      }
+    ],
+    "drench44/house-climate": [
+      {
+        "name": "release script (scripts/release.py, pushed by hand with git push --follow-tags)",
+        "branch": "main",
+        "subject": "^release: v\\d+\\.\\d+\\.\\d+$",
+        "paths": ["VERSION", "CHANGELOG.md", "src/house_climate/web/static/*.html"]
+      }
+    ],
+    "drench44/claude-config-backup": [
+      {
+        "name": "~/.claude config and memory backup (README.md and the cpapclarity release skill's post-merge sweep)",
+        "branch": "master",
+        "subject": "^(backup|memory|skills): "
+      }
+    ]
+  }
+}

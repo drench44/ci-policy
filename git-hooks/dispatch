@@ -1,0 +1,125 @@
+#!/usr/bin/env bash
+# ci-policy global git hook dispatcher. Canonical source: drench44/ci-policy
+# git-hooks/dispatch. Installed by install/install-git-hooks.sh; every file in
+# the global hooks directory (core.hooksPath) calls this with its hook name.
+#
+# Two jobs:
+#   1. Run the house policy for pre-commit (no em dashes, no secrets in added
+#      lines) and pre-push (no pushes to main/master except allowlisted
+#      automation). See lib/ci_policy/local_hooks.py.
+#   2. Chain to the repo's own hook of the same name. Setting core.hooksPath
+#      makes git ignore .git/hooks, which would silently disable per-repo
+#      hooks (changelog guards, privacy scanners, git-lfs). So after the policy
+#      passes, this runs <repo hooks dir>/<hook> with the same arguments and
+#      stdin, and returns its exit code. The repo hooks dir is
+#      git config ci-policy.chainHooksPath (set by the installer when it moves
+#      a repo's own core.hooksPath out of the way), else $GIT_COMMON_DIR/hooks.
+set -u
+
+hook="${1:?usage: dispatch <hook-name> [args...]}"
+shift
+# The install prefix is the directory above this script.
+CI_POLICY_HOME="${CI_POLICY_HOME:-$(cd "$(dirname "$0")/.." && pwd)}"
+
+# Find the repo-local hook to chain to (empty when there is none).
+chain_target() {
+  local dir top
+  dir=$(git config --get ci-policy.chainHooksPath 2>/dev/null || true)
+  if [ -n "$dir" ]; then
+    case "$dir" in
+      /*) ;;
+      \~/*) dir="$HOME/${dir#\~/}" ;;
+      *)
+        # Relative, like core.hooksPath: relative to the worktree top.
+        top=$(git rev-parse --show-toplevel 2>/dev/null) || top="$PWD"
+        dir="$top/$dir" ;;
+    esac
+  else
+    dir=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) \
+      || dir=$(git rev-parse --git-common-dir 2>/dev/null) \
+      || return 0  # no git dir yet (git init, clone): no repo hook can exist
+    case "$dir" in /*) ;; *) dir="$PWD/$dir" ;; esac
+    dir="$dir/hooks"
+  fi
+  if [ ! -d "$dir" ] && [ -n "$(git config --get ci-policy.chainHooksPath 2>/dev/null)" ]; then
+    echo "ci-policy: ci-policy.chainHooksPath points at $dir, which does not exist; this repo's own $hook hook did not run" >&2
+    return 0
+  fi
+  local target="$dir/$hook"
+  [ -f "$target" ] || return 0
+  if [ ! -x "$target" ]; then
+    echo "hint: The '$target' hook was ignored because it's not set as executable." >&2
+    return 0
+  fi
+  # Never chain back into the global hooks directory (that would loop).
+  local self_dir target_dir
+  self_dir="${CI_POLICY_HOOKS_DIR:-}"
+  target_dir=$(cd "$dir" 2>/dev/null && pwd -P)
+  [ -n "$target_dir" ] || return 0
+  [ "$target_dir" != "$self_dir" ] || return 0
+  # A chained hook that is itself a ci-policy wrapper would loop.
+  grep -q "ci-policy managed" "$target" 2>/dev/null && return 0
+  printf '%s\n' "$target"
+}
+
+has_policy=0
+case "$hook" in pre-commit|pre-push) has_policy=1 ;; esac
+
+# A chained hook may run git commands that fire hooks again; that is fine. A
+# chain that points back at a copy of this dispatcher would loop forever, so
+# stop at a depth no real hook setup reaches.
+depth=$(( ${CI_POLICY_DISPATCH_DEPTH:-0} + 1 ))
+if [ "$depth" -gt 4 ]; then
+  echo "ci-policy: hook $hook nested $depth deep; ci-policy.chainHooksPath probably points back at the global hooks. Refusing." >&2
+  exit 1
+fi
+export CI_POLICY_DISPATCH_DEPTH="$depth"
+
+target=$(chain_target)
+if [ "${CI_POLICY_DEBUG:-0}" = 1 ]; then
+  echo "ci-policy debug: hook=$hook chain=${target:-none}" >&2
+fi
+
+# Fast path: nothing to do for this hook in this repo.
+if [ "$has_policy" = 0 ] && [ -z "$target" ]; then
+  exit 0
+fi
+
+# Hooks that read stdin: buffer it so the policy and the chained hook both see it.
+stdin_file=""
+case "$hook" in
+  pre-push|post-rewrite|reference-transaction)
+    stdin_file=$(mktemp "${TMPDIR:-/tmp}/ci-policy-hook.XXXXXX") || exit 1
+    trap 'rm -f "$stdin_file"' EXIT
+    cat >"$stdin_file" || {
+      echo "ci-policy $hook: could not buffer stdin; refusing (fail closed)." >&2
+      exit 1
+    }
+    ;;
+esac
+
+if [ "$has_policy" = 1 ]; then
+  PY="${CI_POLICY_PYTHON:-python3}"
+  if ! command -v "$PY" >/dev/null 2>&1; then
+    echo "ci-policy $hook: $PY not found, so the policy cannot run; refusing (fail closed)." >&2
+    exit 1
+  fi
+  if [ ! -d "$CI_POLICY_HOME/lib/ci_policy" ]; then
+    echo "ci-policy $hook: $CI_POLICY_HOME/lib is missing; reinstall ci-policy. Refusing (fail closed)." >&2
+    exit 1
+  fi
+  if [ -n "$stdin_file" ]; then
+    PYTHONPATH="$CI_POLICY_HOME/lib" PYTHONDONTWRITEBYTECODE=1 \
+      "$PY" -m ci_policy.local_hooks "$hook" "$@" <"$stdin_file" || exit 1
+  else
+    PYTHONPATH="$CI_POLICY_HOME/lib" PYTHONDONTWRITEBYTECODE=1 \
+      "$PY" -m ci_policy.local_hooks "$hook" </dev/null || exit 1
+  fi
+fi
+
+[ -n "$target" ] || exit 0
+if [ -n "$stdin_file" ]; then
+  "$target" "$@" <"$stdin_file"
+  exit $?
+fi
+exec "$target" "$@"

@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# Fake docker for deploy-lib tests. State lives in $STUB_STATE:
+#   services                 output of "compose config --services"
+#   images/<svc>             output of "compose config --images <svc>"
+#   ps/<svc>                 container id for "compose ps -q <svc>"
+#   inspect/<cid>            image id of a container
+#   tags/<ref with / and : as _>  image id a tag points at
+#   up_rc                    exit code for "compose up" (default 0); up_rc_2 for the 2nd up, etc.
+#   fail_config              if present, "compose config" fails
+set -u
+S="$STUB_STATE"
+printf 'docker %s\n' "$*" >>"$S/calls"
+key() { printf '%s' "$1" | tr '/:' '__'; }
+args=("$@")
+if [[ "${args[0]}" == compose ]]; then
+  args=("${args[@]:1}")
+  # skip compose-level options such as -f x -p y
+  while [[ "${args[0]:-}" == -* ]]; do args=("${args[@]:2}"); done
+  case "${args[0]}" in
+    config)
+      [[ -e "$S/fail_config" ]] && { echo "config broken" >&2; exit 1; }
+      if [[ "${args[1]}" == --services ]]; then cat "$S/services"; exit 0; fi
+      if [[ "${args[1]}" == --images ]]; then cat "$S/images/${args[2]}"; exit 0; fi
+      exit 0 ;;
+    ps)
+      svc="${args[2]}"; [[ -f "$S/ps/$svc" ]] && cat "$S/ps/$svc"; exit 0 ;;
+    up)
+      n=$(( $(cat "$S/up_count" 2>/dev/null || echo 0) + 1 )); echo "$n" >"$S/up_count"
+      rc=$(cat "$S/up_rc_$n" 2>/dev/null || cat "$S/up_rc" 2>/dev/null || echo 0)
+      exit "$rc" ;;
+  esac
+  exit 0
+fi
+case "${args[0]}" in
+  rmi)
+    rm -f "$S/tags/$(key "${args[1]}")"; exit 0 ;;
+  inspect)
+    cid="${args[3]}"; [[ -f "$S/inspect/$cid" ]] || exit 1; cat "$S/inspect/$cid"; exit 0 ;;
+  image)
+    if [[ "${args[1]}" == ls ]]; then
+      # image ls --format '{{.Tag}}' <repo>: every tag stored for that repo.
+      prefix="$(key "${args[4]}")_"
+      for f in "$S/tags/$prefix"*; do [[ -e "$f" ]] && printf '%s\n' "${f##*/"$prefix"}"; done
+      exit 0
+    fi
+    ref="${args[4]}"; [[ -f "$S/tags/$(key "$ref")" ]] || exit 1; cat "$S/tags/$(key "$ref")"; exit 0 ;;
+  tag)
+    src="${args[1]}" dst="${args[2]}"
+    [[ -e "$S/fail_tag" ]] && exit 1
+    if [[ -f "$S/tags/$(key "$src")" ]]; then id=$(cat "$S/tags/$(key "$src")"); else id="$src"; fi
+    mkdir -p "$S/tags"; printf '%s\n' "$id" >"$S/tags/$(key "$dst")"; exit 0 ;;
+esac
+exit 0

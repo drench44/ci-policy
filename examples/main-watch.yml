@@ -1,0 +1,17 @@
+# Copy to .github/workflows/main-watch.yml in a repo.
+name: main-watch
+on:
+  push:
+    branches: [main]   # [master] for fleet-dashboard
+permissions:
+  contents: read
+  pull-requests: read
+  checks: read
+  statuses: read
+  issues: write
+jobs:
+  watch:
+    uses: drench44/ci-policy/.github/workflows/main-watch.yml@main
+    with:
+      # Private repo: the OMEN runner. Public repo: '"ubuntu-latest"'.
+      runs-on: '["self-hosted","omen"]'
