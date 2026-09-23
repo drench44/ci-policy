@@ -94,7 +94,7 @@ class AllowCheckTests(Repo):
     def test_branch_on_remote_but_not_fetched_cannot_decide(self):
         other = os.path.join(self.tmp, "other")
         git(self.tmp, "clone", "-q", self.origin, other)
-        git(other, "push", "-q", "origin", "main:master")
+        git(other, "push", "-q", "origin", "refs/remotes/origin/main:refs/heads/master")
         code, err = self.check(branch="master")
         self.assertEqual(code, 2)
         self.assertIn("not fetched", err)

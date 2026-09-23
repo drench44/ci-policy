@@ -81,7 +81,8 @@ _BAND_PATTERNS = [
     # agents overlap" in a layout fix is not read as a band statement.
     re.compile(r"\b" + _COUNT + r"[\s-]+(?:review[\s-]+)?agents?\b", re.I),
 ]
-_REVIEW_CONTEXT = re.compile(r"review|\bband\b", re.I)
+_REVIEW_CONTEXT = re.compile(r"review", re.I)
+_BAND_AFTER = re.compile(r"[\s*_`]*(?:(?:per|in|for)\s+(?:the|this)\s+)?band\b", re.I)
 
 
 def strip_comments(text: str) -> str:
@@ -97,7 +98,8 @@ def find_band(body: str) -> Tuple[Optional[int], str]:
                 start = body.rfind("\n", 0, m.start()) + 1
                 end = body.find("\n", m.end())
                 line = body[start:end if end != -1 else len(body)]
-                if not _REVIEW_CONTEXT.search(line):
+                after = body[m.end():m.end() + 20]
+                if not (_REVIEW_CONTEXT.search(line) or _BAND_AFTER.match(after)):
                     continue
             word = re.sub(r"\s+", " ", m.group(1).lower())
             value = 3 if word == "all three" else _COUNT_VALUE[word]
