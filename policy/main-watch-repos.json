@@ -1,0 +1,16 @@
+{
+  "about": "Repos whose main-watch the out-of-band audit checks (lib/ci_policy/main_watch_audit.py, .github/workflows/main-watch-audit.yml). Add a repo here in the same PR that gives it a main-watch caller, or once that caller is merged. `workflow` is the caller's workflow file when it is not .github/workflows/main-watch.yml.",
+  "repos": {
+    "drench44/ci-policy": {"branch": "main", "workflow": ".github/workflows/policy.yml"},
+    "drench44/cpapclarity": {"branch": "main"},
+    "drench44/family-hub": {"branch": "main"},
+    "drench44/house-climate": {"branch": "main"},
+    "drench44/weather-dashboard": {"branch": "main"},
+    "drench44/garage": {"branch": "main"},
+    "drench44/fleet-dashboard": {"branch": "master"},
+    "drench44/forestmatters-workspace": {"branch": "main"},
+    "drench44/3ddesignlab": {"branch": "main"},
+    "drench44/lizardartist": {"branch": "main"},
+    "drench44/deal-hunter": {"branch": "main"}
+  }
+}

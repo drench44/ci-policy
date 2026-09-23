@@ -1,3 +1,4 @@
+import datetime as dt
 import json
 import os
 import tempfile
@@ -10,6 +11,10 @@ from ci_policy.globs import GlobSet
 from ci_policy.main_watch import Commit, Config, Watcher, parse_allow_rules, plan_push
 
 R = "/repos/drench44/demo"
+# Merged one hour before "now": inside the default 180 minute pending timeout.
+MERGED = "2026-09-22T00:00:00Z"
+NOW = dt.datetime(2026, 9, 22, 1, 0, tzinfo=dt.timezone.utc)
+LATE = dt.datetime(2026, 9, 22, 4, 0, tzinfo=dt.timezone.utc)
 A, B, C, D = "a" * 40, "b" * 40, "c" * 40, "d" * 40
 HEAD = "e" * 40
 
@@ -228,8 +233,11 @@ class VerdictTests(unittest.TestCase):
         self.assertIn("#9", v.reason)
 
     def test_pr_merged_into_other_branch_is_flagged(self):
-        routes = {f"GET {R}/commits/{B}/pulls": [merged_pr(base="develop")], **green_checks()}
-        self.assertFalse(self.watcher(routes).verdict(commit()).ok)
+        routes = {f"GET {R}/commits/{B}/pulls": [merged_pr(base="develop")], **green_checks(),
+                  f"GET {R}/pulls": []}
+        v = self.watcher(routes).verdict(commit())
+        self.assertEqual(v.state, "flag")
+        self.assertIn("#5 into `develop`", v.reason)
 
     def test_failing_check_is_flagged(self):
         runs = [{"name": "test", "status": "completed", "conclusion": "failure",
@@ -327,6 +335,336 @@ class VerdictTests(unittest.TestCase):
         self.assertIn("PR #5", v.reason)
 
 
+def run(name, status="completed", conclusion="success", suite=1, **extra):
+    r = {"name": name, "status": status, "conclusion": conclusion if status == "completed"
+         else None, "check_suite": {"id": suite}}
+    r.update(extra)
+    return r
+
+
+def suite(id_, app="github-actions", status="completed", conclusion="success",
+          branch="feature"):
+    return {"id": id_, "app": {"slug": app}, "status": status, "conclusion": conclusion,
+            "head_branch": branch}
+
+
+class JudgeHelpers(unittest.TestCase):
+    def watcher(self, routes, now=NOW, **cfg):
+        cfg.setdefault("run_id", "999")
+        return Watcher(FakeGitHub(routes), "drench44/demo", "main",
+                       Config(now=lambda: now, **cfg))
+
+    def judge(self, runs=None, statuses=None, suites=None, now=NOW, extra_routes=None, **cfg):
+        routes = {f"GET {R}/commits/{B}/pulls": [merged_pr()],
+                  **green_checks(runs=runs, statuses=statuses, suites=suites),
+                  **(extra_routes or {})}
+        return self.watcher(routes, now=now, **cfg).verdict(commit())
+
+
+class AllGreenTests(JudgeHelpers):
+    """Every check on the head must be green, not just one of them."""
+
+    def test_one_pass_does_not_cover_a_failure(self):
+        v = self.judge(runs=[run("lint"), run("typecheck"), run("test", conclusion="failure")],
+                       statuses=[{"context": "Vercel", "state": "success"}])
+        self.assertEqual(v.state, "flag")
+        self.assertIn("test failure", v.reason)
+
+    def test_every_bad_conclusion_is_red(self):
+        for c in ["failure", "cancelled", "timed_out", "action_required", "stale",
+                  "startup_failure"]:
+            with self.subTest(conclusion=c):
+                v = self.judge(runs=[run("ok"), run("x", conclusion=c)])
+                self.assertEqual(v.state, "flag")
+
+    def test_error_status_is_red_even_with_green_runs(self):
+        v = self.judge(statuses=[{"context": "ci/legacy", "state": "error"}])
+        self.assertEqual(v.state, "flag")
+        self.assertIn("ci/legacy error", v.reason)
+
+    def test_worst_run_of_a_name_counts(self):
+        runs = [run("test", suite=1), run("test", conclusion="failure", suite=2)]
+        v = self.judge(runs=runs, suites=[suite(1), suite(2)])
+        self.assertEqual(v.state, "flag")
+
+    def test_workflow_that_could_not_start_is_red(self):
+        suites = [suite(1), suite(2, conclusion="startup_failure")]
+        v = self.judge(runs=[run("test")], suites=suites)
+        self.assertEqual(v.state, "flag")
+        self.assertIn("startup_failure before any check ran", v.reason)
+
+    def test_empty_failed_suite_from_any_app_is_red(self):
+        v = self.judge(runs=[run("test")],
+                       suites=[suite(1), suite(2, app="vercel", conclusion="failure")])
+        self.assertEqual(v.state, "flag")
+
+    def test_suite_cancelled_before_it_started_is_ignored(self):
+        # Concurrency cancels a queued run when a newer one on the same commit starts.
+        v = self.judge(runs=[run("test")], suites=[suite(1), suite(2, conclusion="cancelled")])
+        self.assertEqual(v.state, "pass", v.reason)
+
+    def test_app_that_never_reports_is_ignored(self):
+        # Seen on every drench44 PR: the Claude app's suite stays queued with no runs.
+        v = self.judge(runs=[run("test")],
+                       suites=[suite(1), suite(2, app="claude", status="queued",
+                                                 conclusion=None)])
+        self.assertEqual(v.state, "pass", v.reason)
+
+    def test_actions_workflow_without_jobs_yet_is_pending(self):
+        v = self.judge(runs=[run("test")],
+                       suites=[suite(1), suite(2, status="queued", conclusion=None)])
+        self.assertEqual(v.state, "pending")
+        self.assertIn("has not started its jobs", v.reason)
+
+    def test_own_status_on_the_head_is_ignored(self):
+        v = self.judge(statuses=[{"context": "ci-policy/main-watch", "state": "pending"}])
+        self.assertEqual(v.state, "pass", v.reason)
+
+
+class PendingAtMergeTests(JudgeHelpers):
+    """Automation that merges without waiting: wait, then decide."""
+
+    def test_check_still_running_waits(self):
+        v = self.judge(runs=[run("lint"), run("Vitest", status="queued")])
+        self.assertEqual(v.state, "pending")
+        self.assertIn("Vitest is queued", v.reason)
+        self.assertIn("merged 60 min ago", v.reason)
+        self.assertEqual(v.pr, 5)
+
+    def test_pending_status_waits(self):
+        v = self.judge(statuses=[{"context": "Vercel", "state": "pending"}])
+        self.assertEqual(v.state, "pending")
+
+    def test_still_running_after_the_timeout_is_flagged(self):
+        v = self.judge(runs=[run("lint"), run("Vitest", status="in_progress")], now=LATE)
+        self.assertEqual(v.state, "flag")
+        self.assertIn("still not green 240 minutes after the merge", v.reason)
+        self.assertIn("Vitest is in_progress", v.reason)
+
+    def test_timeout_is_configurable(self):
+        runs = [run("lint"), run("Vitest", status="in_progress")]
+        self.assertEqual(self.judge(runs=runs, pending_timeout_minutes=30).state, "flag")
+        self.assertEqual(self.judge(runs=runs, now=LATE,
+                                    pending_timeout_minutes=300).state, "pending")
+
+    def test_failure_does_not_wait_for_the_rest(self):
+        v = self.judge(runs=[run("lint", conclusion="failure"), run("Vitest", status="queued")])
+        self.assertEqual(v.state, "flag")
+
+    def test_no_checks_yet_waits_then_flags(self):
+        self.assertEqual(self.judge(runs=[]).state, "pending")
+        v = self.judge(runs=[], now=LATE)
+        self.assertEqual(v.state, "flag")
+        self.assertIn("no checks ran on the PR head", v.reason)
+
+    def test_unknown_merge_time_does_not_wait(self):
+        routes = {f"GET {R}/commits/{B}/pulls": [dict(merged_pr(), merged_at="garbage")],
+                  **green_checks(runs=[run("Vitest", status="queued")])}
+        v = self.watcher(routes).verdict(commit())
+        self.assertEqual(v.state, "flag")
+        self.assertIn("merge time is unknown", v.reason)
+
+
+class RequiredChecksTests(JudgeHelpers):
+    def test_required_check_present_and_green_passes(self):
+        v = self.judge(runs=[run("Vitest (full suite)"), run("lint")],
+                       required_checks=["Vitest (full suite)"])
+        self.assertEqual(v.state, "pass", v.reason)
+
+    def test_required_status_context_counts(self):
+        v = self.judge(statuses=[{"context": "Vercel", "state": "success"}],
+                       required_checks=["Vercel"])
+        self.assertEqual(v.state, "pass", v.reason)
+
+    def test_missing_required_check_is_not_green(self):
+        v = self.judge(runs=[run("lint")], required_checks=["Vitest (full suite)"])
+        self.assertEqual(v.state, "pending")
+        self.assertIn("required check `Vitest (full suite)` has not reported", v.reason)
+        v = self.judge(runs=[run("lint")], required_checks=["Vitest (full suite)"], now=LATE)
+        self.assertEqual(v.state, "flag")
+        self.assertIn("Vitest (full suite)", v.reason)
+
+    def test_required_check_skipped_counts_as_green(self):
+        # GitHub treats a skipped required check as passing.
+        v = self.judge(runs=[run("lint"), run("Vitest", conclusion="skipped")],
+                       required_checks=["Vitest"])
+        self.assertEqual(v.state, "pass", v.reason)
+
+    def test_required_beats_ignore(self):
+        v = self.judge(runs=[run("lint"), run("Vitest", conclusion="failure")],
+                       required_checks=["Vitest"], ignore_checks=GlobSet(["Vitest"]))
+        self.assertEqual(v.state, "flag")
+
+    def test_required_check_from_post_merge_suite_does_not_count(self):
+        # Fast-forward: main's own run of the check sits on the same sha.
+        runs = [run("lint", suite=1), run("Vitest", suite=2)]
+        routes = {f"GET {R}/commits/{B}/pulls": [merged_pr(head=B)],
+                  **green_checks(sha=B, runs=runs,
+                                 suites=[suite(1), suite(2, branch="main")])}
+        v = self.watcher(routes, required_checks=["Vitest"]).verdict(commit())
+        self.assertEqual(v.state, "pending")
+
+
+class RequireChecksAutoTests(JudgeHelpers):
+    WF = f"GET {R}/actions/workflows"
+
+    def flows(self, *paths, state="active"):
+        return {self.WF: {"workflows": [{"path": p, "state": state} for p in paths]}}
+
+    def test_repo_with_other_workflows_needs_a_check(self):
+        v = self.judge(runs=[], now=LATE, require_checks=None,
+                       workflow_path=".github/workflows/main-watch.yml",
+                       extra_routes=self.flows(".github/workflows/main-watch.yml",
+                                               ".github/workflows/ci.yml"))
+        self.assertEqual(v.state, "flag")
+
+    def test_repo_whose_only_workflow_is_main_watch_needs_none(self):
+        v = self.judge(runs=[], now=LATE, require_checks=None,
+                       workflow_path=".github/workflows/main-watch.yml",
+                       extra_routes=self.flows(".github/workflows/main-watch.yml",
+                                               "dynamic/dependabot/dependabot-updates"))
+        self.assertEqual(v.state, "pass", v.reason)
+        self.assertIn("none are required", v.reason)
+
+    def test_disabled_workflows_do_not_count(self):
+        v = self.judge(runs=[], now=LATE, require_checks=None,
+                       extra_routes=self.flows(".github/workflows/old.yml",
+                                               state="disabled_manually"))
+        self.assertEqual(v.state, "pass", v.reason)
+
+    def test_unreadable_workflow_list_means_required(self):
+        with mock.patch("builtins.print"):
+            v = self.judge(runs=[], now=LATE, require_checks=None,
+                           extra_routes={self.WF: gh.GitHubError("forbidden", 403)})
+        self.assertEqual(v.state, "flag")
+
+    def test_skipped_only_still_proves_nothing_when_required(self):
+        v = self.judge(runs=[run("a", conclusion="skipped")], now=LATE, require_checks=None,
+                       extra_routes=self.flows(".github/workflows/ci.yml"))
+        self.assertEqual(v.state, "flag")
+
+
+H_A, H_B, X, M = "1" * 40, "2" * 40, "3" * 40, "4" * 40
+
+
+def pr(number, head, base, merged=True, merge_sha=None):
+    return {"number": number, "merged_at": MERGED if merged else None, "base": {"ref": base},
+            "head": {"sha": head}, "merge_commit_sha": merge_sha}
+
+
+class StackedPRTests(JudgeHelpers):
+    """PR #7 (branch feat-b, base feat-a) merged into feat-a; PR #6 (feat-a) into main."""
+
+    def routes(self, a_checks=None, compare="ahead"):
+        return {
+            # X is a commit of the child PR; M is PR #6's merge commit.
+            f"GET {R}/commits/{X}/pulls": [pr(7, H_B, "feat-a")],
+            f"GET {R}/commits/{M}/pulls": [pr(6, H_A, "main", merge_sha=M)],
+            f"GET {R}/compare/{X}...{H_A}": {"status": compare},
+            **(a_checks or green_checks(sha=H_A)),
+        }
+
+    def test_child_commit_reached_main_inside_the_parent_pr(self):
+        w = self.watcher(self.routes())
+        verdicts = w.evaluate([commit(X, "child work"), commit(M, "Merge pull request #6")])
+        self.assertEqual([v.state for v in verdicts], ["pass", "pass"], verdicts)
+        self.assertIn("PR #6: stacked PR #7 into `feat-a`", verdicts[0].reason)
+        self.assertEqual(verdicts[0].pr, 6)
+
+    def test_parent_checks_red_flags_the_child_commit(self):
+        runs = [run("test", conclusion="failure")]
+        w = self.watcher(self.routes(a_checks=green_checks(sha=H_A, runs=runs)))
+        verdicts = w.evaluate([commit(X), commit(M)])
+        self.assertEqual([v.state for v in verdicts], ["flag", "flag"])
+        self.assertIn("stacked PR #7", verdicts[0].reason)
+
+    def test_found_by_walking_the_base_branch_without_the_push(self):
+        # A re-check sees the child commit alone: find PR #6 from feat-a.
+        routes = self.routes()
+        routes[f"GET {R}/pulls"] = lambda params: (
+            [pr(6, H_A, "main")] if params["head"] == "drench44:feat-a" else [])
+        v = self.watcher(routes).verdict(commit(X))
+        self.assertEqual(v.state, "pass", v.reason)
+        self.assertIn("PR #6", v.reason)
+
+    def test_two_level_stack(self):
+        # #8 (feat-c -> feat-b), #7 (feat-b -> feat-a), #6 (feat-a -> main).
+        routes = {f"GET {R}/commits/{X}/pulls": [pr(8, "5" * 40, "feat-b")],
+                  f"GET {R}/pulls": lambda params: {
+                      "drench44:feat-b": [pr(7, H_B, "feat-a")],
+                      "drench44:feat-a": [pr(6, H_A, "main")]}.get(params["head"], []),
+                  f"GET {R}/compare/{X}...{H_B}": {"status": "ahead"},
+                  f"GET {R}/compare/{X}...{H_A}": {"status": "ahead"},
+                  **green_checks(sha=H_A)}
+        v = self.watcher(routes).verdict(commit(X))
+        self.assertEqual(v.state, "pass", v.reason)
+        self.assertIn("PR #6", v.reason)
+
+    def test_parent_pr_that_does_not_contain_the_commit_is_not_a_carrier(self):
+        routes = self.routes(compare="diverged")
+        routes[f"GET {R}/pulls"] = [pr(6, H_A, "main")]
+        w = self.watcher(routes)
+        verdicts = w.evaluate([commit(X), commit(M)])
+        self.assertEqual(verdicts[0].state, "flag")
+        self.assertIn("merged in #7 into `feat-a`", verdicts[0].reason)
+
+    def test_parent_merged_somewhere_else_is_flagged(self):
+        routes = {f"GET {R}/commits/{X}/pulls": [pr(7, H_B, "feat-a")],
+                  f"GET {R}/pulls": lambda params: {
+                      "drench44:feat-a": [pr(6, H_A, "develop")]}.get(params["head"], []),
+                  f"GET {R}/compare/{X}...{H_A}": {"status": "ahead"}}
+        v = self.watcher(routes).verdict(commit(X))
+        self.assertEqual(v.state, "flag")
+
+    def test_unmerged_parent_is_not_a_carrier(self):
+        routes = {f"GET {R}/commits/{X}/pulls": [pr(7, H_B, "feat-a")],
+                  f"GET {R}/pulls": [pr(6, H_A, "main", merged=False)]}
+        v = self.watcher(routes).verdict(commit(X))
+        self.assertEqual(v.state, "flag")
+
+    def test_stack_cycle_terminates(self):
+        routes = {f"GET {R}/commits/{X}/pulls": [pr(7, H_B, "feat-a")],
+                  f"GET {R}/pulls": lambda params: {
+                      "drench44:feat-a": [pr(6, H_A, "feat-b")],
+                      "drench44:feat-b": [pr(5, "6" * 40, "feat-a")]}.get(params["head"], []),
+                  f"GET {R}/compare/{X}...{H_A}": {"status": "ahead"},
+                  f"GET {R}/compare/{X}...{'6' * 40}": {"status": "ahead"}}
+        v = self.watcher(routes).verdict(commit(X))
+        self.assertEqual(v.state, "flag")
+
+
+class ParseTests(unittest.TestCase):
+    def test_required_checks_one_per_line(self):
+        self.assertEqual(main_watch.parse_required_checks(
+            "Vitest (full suite)\n  # comment\n\nBuild, lint and test\nVitest (full suite)\n"),
+            ["Vitest (full suite)", "Build, lint and test"])
+        self.assertEqual(main_watch.parse_required_checks(""), [])
+
+    def test_require_checks(self):
+        self.assertIsNone(main_watch.parse_require_checks(""))
+        self.assertIsNone(main_watch.parse_require_checks("auto"))
+        self.assertTrue(main_watch.parse_require_checks("true"))
+        self.assertFalse(main_watch.parse_require_checks("false"))
+        with self.assertRaises(ValueError):
+            main_watch.parse_require_checks("sometimes")
+
+    def test_workflow_path_from_ref(self):
+        self.assertEqual(main_watch.workflow_path_from_ref(
+            "drench44/demo/.github/workflows/main-watch.yml@refs/heads/main"),
+            ".github/workflows/main-watch.yml")
+        self.assertEqual(main_watch.workflow_path_from_ref(""), "")
+
+    def test_status_description_keeps_pr_prefix_and_fits(self):
+        v = main_watch.Verdict(commit(), "pending", "PR #12: " + "x" * 300, 12)
+        d = main_watch.status_description(v)
+        self.assertEqual(len(d), 140)
+        self.assertTrue(main_watch.PR_REF.match(d))
+        v = main_watch.Verdict(commit(), "pass", "PR #12: merged with 3 passing", 12)
+        self.assertEqual(main_watch.status_description(v), "PR #12: checks green")
+        v = main_watch.Verdict(commit(), "pass", "allowed by release script")
+        self.assertEqual(main_watch.status_description(v), "allowed by release script")
+
+
 class AlertTests(unittest.TestCase):
     def test_comments_on_open_issue(self):
         api = FakeGitHub({f"GET {R}/issues": [{"number": 3}, {"number": 2},
@@ -352,12 +690,24 @@ class AlertTests(unittest.TestCase):
 
 
 class MainTests(unittest.TestCase):
-    def run_main(self, routes, ev, inputs=None, repo="drench44/demo"):
+    def run_main(self, routes, ev, inputs=None, repo="drench44/demo", extra=None):
+        routes = dict(routes)
+        routes.setdefault(f"POST /repos/{repo}/statuses/*", {})
         fake = FakeGitHub(routes)
-        with ActionsEnv(ev, inputs, {"GITHUB_REPOSITORY": repo}) as env, mock.patch.object(gh, "GitHub", return_value=fake), \
+        env_extra = {"GITHUB_REPOSITORY": repo, **(extra or {})}
+        with ActionsEnv(ev, inputs, env_extra) as env, \
+                mock.patch.object(gh, "GitHub", return_value=fake), \
                 mock.patch("builtins.print"):
             code = main_watch.main()
             return code, env.summary(), env.outputs(), fake
+
+    @staticmethod
+    def issue_bodies(fake):
+        return [b["body"] for p, b in fake.posts if "/statuses/" not in p and "body" in b]
+
+    @staticmethod
+    def statuses(fake):
+        return {p.rsplit("/", 1)[1]: b for p, b in fake.posts if "/statuses/" in p}
 
     def compare(self, *commits, status="ahead"):
         return {f"GET {R}/compare/{A}...{C}": {"status": status, "total_commits": len(commits),
@@ -370,7 +720,11 @@ class MainTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("passed", summary)
         self.assertIn("result=pass", out)
-        self.assertEqual(fake.posts, [])
+        self.assertEqual(self.issue_bodies(fake), [])
+        self.assertEqual(self.statuses(fake)[C]["state"], "success")
+        self.assertEqual(self.statuses(fake)[C]["context"], "ci-policy/main-watch")
+        self.assertEqual(self.statuses(fake)[C]["description"], "PR #5: checks green")
+        self.assertIn("/actions/runs/999", self.statuses(fake)[C]["target_url"])
 
     def test_direct_push_opens_issue_and_fails(self):
         routes = {**self.compare(api_commit(C, "hotfix straight to main")),
@@ -381,8 +735,9 @@ class MainTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("opened #12", summary)
         self.assertIn("result=alert", out)
-        issue_body = fake.posts[-1][1]["body"]
+        issue_body = self.issue_bodies(fake)[-1]
         self.assertIn("hotfix straight to main", issue_body)
+        self.assertEqual(self.statuses(fake)[C]["state"], "failure")
         self.assertIn("nothing was reverted", issue_body)
 
     def test_fail_on_alert_false_keeps_job_green(self):
@@ -472,8 +827,145 @@ class MainTests(unittest.TestCase):
                   f"GET {R}/issues": [], f"POST {R}/labels": {}, f"POST {R}/issues": {"number": 1}}
         code, summary, _, fake = self.run_main(routes, event(forced=True))
         self.assertEqual(code, 1)
-        self.assertIn("Force push", fake.posts[-1][1]["body"])
+        self.assertIn("Force push", self.issue_bodies(fake)[-1])
 
+
+    def test_checks_running_at_merge_wait_without_an_issue(self):
+        routes = {**self.compare(api_commit(C, "Stats update (#5)")),
+                  f"GET {R}/commits/{C}/pulls": [merged_pr()],
+                  **green_checks(runs=[run("lint"), run("Vitest", status="queued")])}
+        with mock.patch.object(main_watch, "utcnow", return_value=NOW):
+            code, summary, out, fake = self.run_main(routes, event())
+        self.assertEqual(code, 0, summary)
+        self.assertIn("result=pending", out)
+        self.assertIn("WAIT", summary)
+        self.assertEqual(self.issue_bodies(fake), [])
+        st = self.statuses(fake)[C]
+        self.assertEqual(st["state"], "pending")
+        self.assertTrue(st["description"].startswith("PR #5: waiting on head"), st)
+
+    def test_status_write_failure_fails_the_job(self):
+        routes = {**self.compare(api_commit(C, "Feature (#5)")),
+                  f"GET {R}/commits/{C}/pulls": [merged_pr()], **green_checks(),
+                  f"POST {R}/statuses/*": gh.GitHubError("Resource not accessible", 403)}
+        with mock.patch.object(gh, "annotate") as annotate:
+            code, summary, _, _ = self.run_main(routes, event())
+        self.assertEqual(code, 1)
+        self.assertIn("Could not set the ci-policy/main-watch status", summary)
+        self.assertTrue(any("statuses: write" in c[0][1] for c in annotate.call_args_list))
+
+    def test_set_status_false_writes_none(self):
+        routes = {**self.compare(api_commit(C, "Feature (#5)")),
+                  f"GET {R}/commits/{C}/pulls": [merged_pr()], **green_checks()}
+        code, _, _, fake = self.run_main(routes, event(), {"set-status": "false"})
+        self.assertEqual(code, 0)
+        self.assertEqual(self.statuses(fake), {})
+
+    def test_bad_timeout_input_fails_loudly(self):
+        code, summary, _, _ = self.run_main({}, event(), {"pending-timeout-minutes": "-5"})
+        self.assertEqual(code, 1)
+        self.assertIn("pending-timeout-minutes", summary)
+
+    def test_workflow_ref_feeds_auto_require(self):
+        routes = {**self.compare(api_commit(C, "Feature (#5)")),
+                  f"GET {R}/commits/{C}/pulls": [merged_pr()], **green_checks(runs=[]),
+                  f"GET {R}/actions/workflows": {"workflows": [
+                      {"path": ".github/workflows/main-watch.yml", "state": "active"}]}}
+        code, summary, _, _ = self.run_main(
+            routes, event(), extra={
+                "GITHUB_WORKFLOW_REF":
+                    "drench44/demo/.github/workflows/main-watch.yml@refs/heads/main"})
+        self.assertEqual(code, 0, summary)
+        self.assertIn("none are required", summary)
+
+
+class RecheckTests(unittest.TestCase):
+    """The scheduled run re-reads checks for commits a push left pending."""
+
+    run_main = MainTests.run_main
+    issue_bodies = staticmethod(MainTests.issue_bodies)
+    statuses = staticmethod(MainTests.statuses)
+
+    SCHEDULE = {"GITHUB_EVENT_NAME": "schedule"}
+
+    def recheck(self, routes, now=NOW, inputs=None):
+        ev = {"schedule": "17 * * * *", "repository": {"default_branch": "main"}}
+        with mock.patch.object(main_watch, "utcnow", return_value=now):
+            return self.run_main(routes, ev, inputs, extra=self.SCHEDULE)
+
+    def base_routes(self, head_runs):
+        return {
+            f"GET {R}/commits": [api_commit(C, "Stats update (#5)"), api_commit(B, "older")],
+            f"GET {R}/commits/{C}/status": {"statuses": [
+                {"context": "ci-policy/main-watch", "state": "pending",
+                 "description": "PR #5: waiting on head eeeeeee checks: Vitest is queued"}]},
+            f"GET {R}/commits/{B}/status": {"statuses": [
+                {"context": "ci-policy/main-watch", "state": "success"}]},
+            f"GET {R}/pulls/5": merged_pr(),
+            **green_checks(runs=head_runs),
+        }
+
+    def test_pending_commit_turns_green(self):
+        code, summary, out, fake = self.recheck(self.base_routes([run("lint"), run("Vitest")]))
+        self.assertEqual(code, 0, summary)
+        self.assertIn("result=pass", out)
+        self.assertEqual(set(self.statuses(fake)), {C})
+        self.assertEqual(self.statuses(fake)[C]["state"], "success")
+        self.assertEqual(self.issue_bodies(fake), [])
+        since = [c for c in fake.calls if c[1] == f"{R}/commits"][0][2]["since"]
+        self.assertEqual(since, "2026-09-20T22:00:00Z")   # 24 h + 180 min back
+
+    def test_still_running_stays_pending(self):
+        code, _, out, fake = self.recheck(self.base_routes([run("Vitest", status="queued")]))
+        self.assertEqual(code, 0)
+        self.assertIn("result=pending", out)
+        self.assertEqual(self.statuses(fake)[C]["state"], "pending")
+
+    def test_timeout_flags_and_opens_an_issue(self):
+        routes = {**self.base_routes([run("Vitest", status="queued")]),
+                  f"GET {R}/issues": [], f"POST {R}/labels": {},
+                  f"POST {R}/issues": {"number": 21}}
+        code, summary, out, fake = self.recheck(routes, now=LATE)
+        self.assertEqual(code, 1)
+        self.assertIn("result=alert", out)
+        self.assertEqual(self.statuses(fake)[C]["state"], "failure")
+        body = self.issue_bodies(fake)[-1]
+        self.assertIn("re-checked commits", body)
+        self.assertIn("still not green 240 minutes after the merge", body)
+
+    def test_late_failure_flags(self):
+        routes = {**self.base_routes([run("Vitest", conclusion="failure")]),
+                  f"GET {R}/issues": [{"number": 3}], f"POST {R}/issues/3/comments": {}}
+        code, summary, _, fake = self.recheck(routes)
+        self.assertEqual(code, 1)
+        self.assertIn("commented on #3", summary)
+
+    def test_nothing_pending_is_quiet(self):
+        routes = {f"GET {R}/commits": [api_commit(B, "older")],
+                  f"GET {R}/commits/{B}/status": {"statuses": []}}
+        code, summary, out, fake = self.recheck(routes)
+        self.assertEqual(code, 0)
+        self.assertIn("result=pass", out)
+        self.assertIn("is waiting on checks", summary)
+        self.assertEqual(fake.posts, [])
+
+    def test_description_without_pr_falls_back_to_a_full_verdict(self):
+        routes = {f"GET {R}/commits": [api_commit(C, "x")],
+                  f"GET {R}/commits/{C}/status": {"statuses": [
+                      {"context": "ci-policy/main-watch", "state": "pending",
+                       "description": "something else"}]},
+                  f"GET {R}/commits/{C}/pulls": [merged_pr()], **green_checks()}
+        code, summary, _, fake = self.recheck(routes)
+        self.assertEqual(code, 0, summary)
+        self.assertEqual(self.statuses(fake)[C]["state"], "success")
+
+    def test_recheck_api_failure_is_loud(self):
+        routes = {f"GET {R}/commits": gh.GitHubError("down", 502),
+                  f"GET {R}/issues": [], f"POST {R}/labels": {},
+                  f"POST {R}/issues": {"number": 4}}
+        code, summary, _, fake = self.recheck(routes)
+        self.assertEqual(code, 1)
+        self.assertIn("could not re-check pending commits", self.issue_bodies(fake)[0])
 
 if __name__ == "__main__":
     unittest.main()

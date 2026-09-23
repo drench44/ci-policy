@@ -1,0 +1,7 @@
+# Keeps the SHA-pinned actions current; the version comments are updated with them.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly

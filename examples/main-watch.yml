@@ -3,15 +3,26 @@ name: main-watch
 on:
   push:
     branches: [main]   # [master] for fleet-dashboard
+  # Re-check commits whose PR checks were still running when the PR was merged.
+  schedule:
+    - cron: "41 * * * *"
+  workflow_dispatch:
 permissions:
   contents: read
   pull-requests: read
   checks: read
-  statuses: read
+  actions: read     # require-checks: auto lists the repo's workflows
+  statuses: write   # the ci-policy/main-watch status on each judged commit
   issues: write
 jobs:
   watch:
-    uses: drench44/ci-policy/.github/workflows/main-watch.yml@main
+    # Pin to a ci-policy commit (full SHA), and pass the same SHA as
+    # ci-policy-ref: it picks the watch code and the allowlist.
+    uses: drench44/ci-policy/.github/workflows/main-watch.yml@<full sha> # main @ <short sha>
     with:
+      ci-policy-ref: <full sha>
       # Private repo: the OMEN runner. Public repo: '"ubuntu-latest"'.
       runs-on: '["self-hosted","omen"]'
+      # Optional: checks that must be present and green on every PR head.
+      # required-checks: |
+      #   Vitest (full suite)
