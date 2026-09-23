@@ -270,6 +270,13 @@ dl_image_for() {
     printf 'the compose config gave %s no single image name (got "%s")' "$svc" "${out:0:200}"
     return 1
   fi
+  # A digest pin (x@sha256:...) cannot be rolled back by retagging: compose
+  # would still run the digest the file names, so the rollback would report
+  # success and change nothing. Refuse it until the library handles digests.
+  if [[ "$out" == *@* ]]; then
+    printf 'service %s is pinned by digest (%s); this library can only roll back a tag' "$svc" "$out"
+    return 1
+  fi
   printf '%s\n' "$out"
 }
 
@@ -483,7 +490,7 @@ dl_record_pre() {
   DL_PRE=""
   DL_UNRECORDED=""
   DL_PRE_TAG="pre-$DL_STAMP-$DL_SHORT_SHA"
-  local svc image id repo tag services
+  local svc image id repo tag services tagged=$'\n' prev
   services=$(dl_services) || { dl_err "could not list compose services"; return 1; }
   for svc in $services; do
     image=$(dl_image_for "$svc") || { dl_err "could not read the image name for $svc: $image"; return 1; }
@@ -494,6 +501,16 @@ dl_record_pre() {
       DL_UNRECORDED+="$svc "
       continue
     fi
+    # Two services on one image repo share one pre- tag. That is only a
+    # rollback point for both when they run the same image; otherwise the
+    # second tag would replace the first and a rollback would put both
+    # services on the second one's image.
+    prev=$(printf '%s' "$tagged" | awk -v r="$repo" '$1==r{print $2; exit}')
+    if [[ -n "$prev" && "$prev" != "$id" ]]; then
+      dl_err "$svc and another service both use $repo but run different images ($prev, $id); one pre- tag cannot roll both back"
+      return 1
+    fi
+    tagged+="$repo $id"$'\n'
     dl_docker tag "$id" "$repo:$DL_PRE_TAG" \
       || { dl_err "could not tag $svc's running image as $repo:$DL_PRE_TAG"; return 1; }
     dl_log "rollback point: $svc runs $repo:$DL_PRE_TAG"

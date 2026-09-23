@@ -754,7 +754,8 @@ for cfg in '{"name":"hub","services":{"other":{"image":"x"}}}' \
            '{"name":"hub","services":{"web":{"command":"x"}}}' \
            'not json' \
            '{"name":"hub","services":{"web":{"image":"a b"}}}' \
-           '{"services":{"web":{"build":{"context":"."}}}}'; do
+           '{"services":{"web":{"build":{"context":"."}}}}' \
+           '{"name":"hub","services":{"web":{"image":"hub-web@sha256:abc"}}}'; do
   printf '%s\n' "$cfg" >"$STUB_STATE/config_json"; : >"$STUB_STATE/calls"
   run_deploy DL_TAG_PUSH=0
   assert_eq "$RC" 3 "(config $cfg) $OUT"
@@ -768,6 +769,33 @@ run_deploy DL_TAG_PUSH=0
 assert_eq "$RC" 3 "$OUT"
 assert_contains "$OUT" "docker compose config --format json web failed"
 assert_not_contains "$CALLS" "up -d"
+teardown
+
+setup "a digest-pinned image is refused, not recorded as :latest"
+printf '%s\n' '{"name":"hub","services":{"web":{"image":"hub-web@sha256:abc"}}}' >"$STUB_STATE/config_json"
+run_deploy DL_TAG_PUSH=0
+assert_eq "$RC" 3 "$OUT"
+assert_contains "$OUT" "pinned by digest"
+assert_not_contains "$(ls "$STUB_STATE/tags")" "hub-web_latest"
+teardown
+
+setup "two services on one image repo running different images stop before anything restarts"
+printf 'web\nworker\n' >"$STUB_STATE/services"
+echo hub-web >"$STUB_STATE/images/worker"
+echo c2 >"$STUB_STATE/ps/worker"; echo sha256:WORKERID >"$STUB_STATE/inspect/c2"
+run_deploy DL_TAG_PUSH=0
+assert_eq "$RC" 3 "$OUT"
+assert_contains "$OUT" "run different images"
+assert_not_contains "$CALLS" "up -d"
+teardown
+
+setup "two services on one image repo running the same image share one rollback point"
+printf 'web\nworker\n' >"$STUB_STATE/services"
+echo hub-web >"$STUB_STATE/images/worker"
+echo c2 >"$STUB_STATE/ps/worker"; echo sha256:OLDID >"$STUB_STATE/inspect/c2"
+run_deploy DL_TAG_PUSH=0
+assert_eq "$RC" 0 "$OUT"
+assert_eq "$(cat "$STUB_STATE/tags/hub-web_$PRE")" "sha256:OLDID"
 teardown
 
 setup "the image name comes over ssh for a remote box too"
