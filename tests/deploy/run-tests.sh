@@ -622,7 +622,21 @@ assert_eq "$RC" 4 "$OUT"
 teardown
 
 setup "dying mid-deploy prints what state it was in and the rollback command"
-run_deploy "dl_wait_healthy() { exit 7; }"
+# Through homelab-deploy, as a real deploy runs (its own process, not a
+# command substitution: bash 3.2 skips EXIT traps inside those).
+cat >"$T/repo/die.conf" <<EOF
+DL_SERVICE=hub
+DL_COMPOSE_DIR='$T/compose'
+DL_HEALTH_URL=http://box/health
+DL_HEALTH_REQUIRE=.ok
+DL_STATE_DIR='$T/boxstate'
+DL_TAG_PUSH=0
+dl_wait_healthy() { exit 7; }
+EOF
+git -C "$T/repo" add die.conf; git -C "$T/repo" commit -qm die
+PATH="$HERE/stubs:$PATH" bash "$HERE/../../deploy/homelab-deploy" "$T/repo/die.conf" >"$T/die.out" 2>&1
+RC=$?; OUT=$(cat "$T/die.out")
+assert_eq "$RC" 7
 assert_contains "$OUT" "deploy ABORTED during 'checking'"
 assert_contains "$OUT" "docker tag hub-web:pre-"
 teardown
