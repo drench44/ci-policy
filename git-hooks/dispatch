@@ -76,6 +76,9 @@ fi
 export CI_POLICY_DISPATCH_DEPTH="$depth"
 
 target=$(chain_target)
+if [ "${CI_POLICY_DEBUG:-0}" = 1 ]; then
+  echo "ci-policy debug: hook=$hook chain=${target:-none}" >&2
+fi
 
 # Fast path: nothing to do for this hook in this repo.
 if [ "$has_policy" = 0 ] && [ -z "$target" ]; then
