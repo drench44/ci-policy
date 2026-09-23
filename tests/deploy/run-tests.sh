@@ -837,8 +837,8 @@ teardown
 
 setup "pruning never touches another repo's tags, and prunes a shared repo once"
 printf 'web\nworker\n' >"$STUB_STATE/services"
-echo hub-web >"$STUB_STATE/images/worker"   # two services, one image repo
-echo c2 >"$STUB_STATE/ps/worker"; echo sha256:WORKERID >"$STUB_STATE/inspect/c2"
+echo hub-web >"$STUB_STATE/images/worker"   # two services, one image repo, same image (a different one is refused)
+echo c2 >"$STUB_STATE/ps/worker"; echo sha256:OLDID >"$STUB_STATE/inspect/c2"
 for t in pre-20260101T000000Z-aaaaaaaaaaaa pre-20260102T000000Z-bbbbbbbbbbbb; do
   echo sha256:X >"$STUB_STATE/tags/hub-web_$t"
   echo sha256:X >"$STUB_STATE/tags/timescale_timescaledb_$t"
