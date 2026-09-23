@@ -132,7 +132,10 @@ Machine-local exception on both: weather-dashboard's vendored
    before anything restarts.
 4. `docker compose up -d --build`, then polls health, and checks once more
    after `DL_HEALTH_SETTLE` seconds. If the app can report its commit,
-   `DL_HEALTH_COMMIT` proves the new version is the one answering.
+   `DL_HEALTH_COMMIT` proves the new version is the one answering. A config
+   can add a check the JSON cannot make by defining `dl_health_extra` (for
+   example a headless page load over the LAN IP, or the ports a container
+   publishes); it runs only once the JSON passes, and it never replaces it.
 5. Healthy: records the commit on the box, pushes `deploy/<service>/<time>-<sha>`.
    Unhealthy: restores the files and images, recreates without building,
    checks health again, pushes `failed-deploy/<service>/<time>-<sha>`.
