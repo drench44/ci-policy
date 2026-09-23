@@ -1,0 +1,39 @@
+# Out-of-band check that main-watch actually ran. main-watch runs on each
+# repo's own runner (the OMEN for private repos); when that runner is down the
+# job sits queued and says nothing. This runs on a GitHub-hosted runner (free:
+# this repo is public), reads every repo in policy/main-watch-repos.json with a
+# read-only token, and opens an issue here (GitHub emails it) for any push that
+# has no main-watch conclusion after grace-hours. See README, "Main watch
+# audit". garage's fleet-watch alerts if this workflow stops running.
+name: main-watch-audit
+on:
+  schedule:
+    - cron: "23 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: main-watch-audit
+  cancel-in-progress: false
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - name: Audit main-watch across the watched repos
+        env:
+          PYTHONPATH: ${{ github.workspace }}/lib
+          PYTHONDONTWRITEBYTECODE: "1"
+          INPUT_TOKEN: ${{ github.token }}
+          INPUT_AUDIT_TOKEN: ${{ secrets.MAIN_WATCH_AUDIT_TOKEN }}
+          INPUT_REPOS_FILE: ${{ github.workspace }}/policy/main-watch-repos.json
+          INPUT_GRACE_HOURS: "6"
+          INPUT_LOOKBACK_HOURS: "72"
+        run: python3 -m ci_policy.main_watch_audit

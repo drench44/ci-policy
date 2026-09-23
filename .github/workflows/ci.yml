@@ -18,7 +18,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - name: Tool versions
         run: |
           bash --version | head -n 1
@@ -37,7 +37,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - name: shellcheck
         run: |
           shellcheck -S warning git-hooks/dispatch install/install-git-hooks.sh deploy/deploy-lib.sh \
@@ -45,7 +45,7 @@ jobs:
           shellcheck -S warning -x -P SCRIPTDIR deploy/homelab-deploy tests/deploy/run-tests.sh \
             tests/git-hooks/run-tests.sh
       - name: actionlint
-        uses: docker://rhysd/actionlint:1.7.7
+        uses: docker://rhysd/actionlint@sha256:887a259a5a534f3c4f36cb02dca341673c6089431057242cdc931e9f133147e9 # 1.7.7
         with:
           args: -color
       - name: No em dashes anywhere in the repo

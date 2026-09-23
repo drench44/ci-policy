@@ -1,0 +1,16 @@
+{
+  "about": "Repos whose main-watch the out-of-band audit checks (lib/ci_policy/main_watch_audit.py, .github/workflows/main-watch-audit.yml). `since` is when the repo's main-watch caller merged: earlier pushes had no main-watch to conclude on and are not audited. Add a repo in the same change that gives it a caller (or once that caller is merged). `workflow` is the caller's workflow file when it is not .github/workflows/main-watch.yml.",
+  "repos": {
+    "drench44/ci-policy": {"branch": "main", "workflow": ".github/workflows/policy.yml", "since": "2026-09-23T01:19:00Z"},
+    "drench44/cpapclarity": {"branch": "main", "since": "2026-09-23T14:49:00Z"},
+    "drench44/family-hub": {"branch": "main", "since": "2026-09-23T14:43:00Z"},
+    "drench44/house-climate": {"branch": "main", "since": "2026-09-23T14:43:00Z"},
+    "drench44/weather-dashboard": {"branch": "main", "since": "2026-09-23T14:43:00Z"},
+    "drench44/garage": {"branch": "main", "since": "2026-09-23T14:43:00Z"},
+    "drench44/fleet-dashboard": {"branch": "master", "since": "2026-09-23T14:43:00Z"},
+    "drench44/forestmatters-workspace": {"branch": "main", "since": "2026-09-23T14:43:00Z"},
+    "drench44/3ddesignlab": {"branch": "main", "since": "2026-09-23T14:43:00Z"},
+    "drench44/lizardartist": {"branch": "main", "since": "2026-09-23T14:43:00Z"},
+    "drench44/deal-hunter": {"branch": "main", "since": "2026-09-23T14:43:00Z"}
+  }
+}

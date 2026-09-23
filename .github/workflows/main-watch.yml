@@ -1,9 +1,13 @@
-# Reusable main-branch watchdog. Call it on push to the default branch; see
-# examples/main-watch.yml. Every new commit must come from a merged PR whose
-# head checks were green, or match policy/main-allowlist.json. Anything else,
-# and any force push or branch deletion, opens (or comments on) one issue
-# labeled main-watch, which GitHub emails to the repo owner. Alerts only; it
-# never reverts anything.
+# Reusable main-branch watchdog. Call it on push to the default branch AND on a
+# schedule; see examples/main-watch.yml. Every new commit must come from a
+# merged PR whose head checks were all green (or match
+# policy/main-allowlist.json). Anything else, and any force push or branch
+# deletion, opens (or comments on) one issue labeled main-watch, which GitHub
+# emails to the repo owner. Checks still running when the PR was merged are
+# waited for: the commit gets a pending ci-policy/main-watch status and the
+# scheduled run re-reads them until pending-timeout-minutes. Every judged
+# commit gets that status; main-watch-audit.yml reads it from outside the
+# homelab. Alerts only; it never reverts anything.
 name: main-watch
 
 on:
@@ -33,6 +37,25 @@ on:
         description: Check names (globs) to leave out when judging a PR head.
         type: string
         default: ""
+      required-checks:
+        description: >-
+          Check run names or commit status contexts that must be present and
+          green on the PR head, one per line, exact names (for example
+          "Vitest (full suite)"). A missing one counts as not green.
+        type: string
+        default: ""
+      require-checks:
+        description: >-
+          Whether a PR head needs at least one passing check. auto (default):
+          yes when the repo has any active workflow besides this one.
+        type: string
+        default: auto
+      pending-timeout-minutes:
+        description: >-
+          How long after the merge to keep waiting for checks that were still
+          running when the PR was merged, before flagging the commit.
+        type: string
+        default: "180"
       fail-on-alert:
         description: Also turn this run red when something is flagged.
         type: string
@@ -42,16 +65,17 @@ permissions:
   contents: read
   pull-requests: read
   checks: read
-  statuses: read
+  actions: read
+  statuses: write
   issues: write
 
 jobs:
   main-watch:
     runs-on: ${{ fromJSON(inputs.runs-on) }}
-    timeout-minutes: 5
+    timeout-minutes: 10
     steps:
       - name: Check out ci-policy
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           repository: drench44/ci-policy
           ref: ${{ inputs.ci-policy-ref }}
@@ -66,5 +90,8 @@ jobs:
           INPUT_ALLOWLIST_FILE: ${{ github.workspace }}/.ci-policy/policy/main-allowlist.json
           INPUT_ALLOW_RULES: ${{ inputs.allow-rules }}
           INPUT_IGNORE_CHECKS: ${{ inputs.ignore-checks }}
+          INPUT_REQUIRED_CHECKS: ${{ inputs.required-checks }}
+          INPUT_REQUIRE_CHECKS: ${{ inputs.require-checks }}
+          INPUT_PENDING_TIMEOUT_MINUTES: ${{ inputs.pending-timeout-minutes }}
           INPUT_FAIL_ON_ALERT: ${{ inputs.fail-on-alert }}
         run: python3 -m ci_policy.main_watch

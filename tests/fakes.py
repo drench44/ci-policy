@@ -20,18 +20,29 @@ class FakeGitHub:
         self.routes: Dict[str, Any] = dict(routes or {})
         self.calls: List[Tuple[str, str, Any]] = []
         self.posts: List[Tuple[str, Any]] = []
+        # Response headers by path, for request().
+        self.headers: Dict[str, Dict[str, str]] = {}
 
     def _answer(self, method: str, path: str, params: Any = None, body: Any = None) -> Any:
         self.calls.append((method, path, params if method == "GET" else body))
         key = f"{method} {path}"
         if key not in self.routes:
-            raise gh.GitHubError(f"{key} -> HTTP 404: not stubbed", 404)
+            # "METHOD /prefix/*" answers every path under that prefix.
+            wild = [k for k in self.routes if k.endswith("/*") and key.startswith(k[:-1])]
+            if not wild:
+                raise gh.GitHubError(f"{key} -> HTTP 404: not stubbed", 404)
+            key = max(wild, key=len)
         value = self.routes[key]
         if isinstance(value, Callable):  # type: ignore[arg-type]
             value = value(params if method == "GET" else body)
         if isinstance(value, gh.GitHubError):
             raise value
         return value
+
+    def request(self, method: str, path: str, body: Any = None,
+                params: Any = None) -> Tuple[int, Any, Dict[str, str]]:
+        payload = self._answer(method, path, params if method == "GET" else body)
+        return 200, payload, dict(self.headers.get(path, {}))
 
     def get(self, path: str, params: Any = None) -> Any:
         return self._answer("GET", path, params)
