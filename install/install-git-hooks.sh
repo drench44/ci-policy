@@ -175,9 +175,16 @@ point_git_at_hooks() {
     elif [[ -n "$current" ]]; then
       say "note: global core.hooksPath is $current (not ours); scoped repos use ours via includeIf"
     fi
-    local scope
+    local scope real
     for scope in "${SCOPES[@]}"; do
       run git config --global "includeIf.gitdir:$scope/.path" "$INCLUDE_FILE"
+      # git matches includeIf against the resolved path of the repo, so a
+      # scope reached through a symlink (macOS /var -> /private/var) needs its
+      # real path too.
+      real=$(cd "$scope" 2>/dev/null && pwd -P || true)
+      if [[ -n "$real" && "$real" != "$scope" ]]; then
+        run git config --global "includeIf.gitdir:$real/.path" "$INCLUDE_FILE"
+      fi
       say "scoped: repos under $scope/ use $HOOKS_DIR"
     done
   else

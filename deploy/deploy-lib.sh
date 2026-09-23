@@ -339,8 +339,11 @@ dl_prune_pre_tags() {
     while IFS= read -r old; do
       [[ -n "$old" ]] || continue
       dl_docker rmi "$repo:$old" >/dev/null 2>&1 || dl_warn "could not remove old tag $repo:$old"
-    done < <(dl_docker image ls --format '{{.Tag}}' "$repo" 2>/dev/null | grep '^pre-' \
-               | sort -r | tail -n +$((keep + 1)))
+    # Only tags this library wrote (pre-<UTC stamp>-<sha>); hand-made tags
+    # such as pre-port-abc stay. Never the one this run just made.
+    done < <(dl_docker image ls --format '{{.Tag}}' "$repo" 2>/dev/null \
+               | grep -E '^pre-[0-9]{8}T[0-9]{6}Z-[0-9a-f]+$' | grep -vx "$DL_PRE_TAG" \
+               | sort -r | tail -n +"$keep")
   done <<<"${DL_PRE:-}"
   return 0
 }
@@ -578,8 +581,8 @@ dl_git_tag() {
 # rollback point. Unknown (first deploy with this library) is a warning.
 dl_tag_rollback_point() {
   [[ "${DL_TAG_PUSH:-1}" == 1 ]] || return 0
-  local prev gitdir="${DL_GIT_DIR:-.}"
-  if ! prev=$(dl_read_deployed_sha); then
+  local prev="${DL_PREV_SHA:-}" gitdir="${DL_GIT_DIR:-.}"
+  if [[ "${DL_PREV_READ_FAILED:-0}" == 1 ]]; then
     dl_warn "could not read the box's deployed-commit record, so git gets no rollback-point tag this time"
     return 1
   fi
@@ -607,6 +610,14 @@ _dl_abort_before_restart() {
   esac
 }
 
+# Put back whatever traps the caller had before dl_run set its own.
+_dl_restore_traps() {
+  trap - EXIT INT TERM HUP
+  [[ -n "${DL_SAVED_TRAPS:-}" ]] && eval "$DL_SAVED_TRAPS"
+  DL_SAVED_TRAPS=""
+  return 0
+}
+
 # If the shell dies after the restart (Ctrl-C, ssh drop, set -u), say so.
 _dl_on_exit() {
   local rc=$?
@@ -628,10 +639,15 @@ dl_run() {
   local services
   services=$(dl_services) || { dl_err "could not list compose services"; return 3; }
   dl_log "deploying $DL_SHORT_SHA (services: ${services//$'\n'/ }) with deploy-lib $DL_LIB_VERSION"
+  # What the box runs now (for the rollback-point tag, and for the commit
+  # check while probing the old version).
+  DL_PREV_SHA="" DL_PREV_READ_FAILED=0
+  DL_PREV_SHA=$(dl_read_deployed_sha) || { DL_PREV_SHA=""; DL_PREV_READ_FAILED=1; }
   # A gate that cannot even read the current version is worth knowing about
-  # before anything changes (for example curl missing on the box).
+  # before anything changes (for example curl missing on the box). The old
+  # version reports the old commit, so the commit check uses that one.
   local now_reason
-  if ! now_reason=$(DL_PROBE=pre dl_health_once); then
+  if ! now_reason=$(DL_PROBE=pre DL_FULL_SHA="$DL_PREV_SHA" dl_health_once); then
     dl_warn "the version running now does not pass the health gate: $now_reason"
   fi
   dl_record_pre || { dl_err "stopping before deploy: could not record rollback points"; return 3; }
@@ -652,6 +668,7 @@ dl_run() {
     return 2
   fi
 
+  DL_SAVED_TRAPS=$(trap -p EXIT INT TERM HUP)
   trap '_dl_on_exit' EXIT INT TERM HUP
   DL_PHASE=restarting
   # shellcheck disable=SC2086  # DL_UP_ARGS and DL_SERVICES are word lists on purpose
@@ -659,7 +676,7 @@ dl_run() {
     DL_PHASE=checking
     if dl_wait_healthy; then
       DL_PHASE=""
-      trap - EXIT INT TERM HUP
+      _dl_restore_traps
       dl_write_deployed_sha || { dl_err "could not record the deployed commit on the box"; tag_rc=4; }
       dl_git_tag "deploy/$DL_SERVICE/$DL_STAMP-$DL_SHORT_SHA" "$DL_FULL_SHA" \
         "Deployed $DL_SERVICE at $DL_SHORT_SHA ($DL_STAMP), healthy." || tag_rc=4
@@ -678,7 +695,7 @@ dl_run() {
   if [[ -z "${DL_PRE:-}" ]]; then
     dl_restore_snapshot || true
     DL_PHASE=""
-    trap - EXIT INT TERM HUP
+    _dl_restore_traps
     dl_err "no image rollback point was recorded, so nothing can be rolled back. SERVICE IS DOWN."
     return 2
   fi
@@ -686,7 +703,8 @@ dl_run() {
   local files_rc=0
   dl_restore_snapshot || files_rc=$?
   rc=2
-  if dl_rollback && dl_wait_healthy; then
+  # After the rollback the old version answers, with the old commit.
+  if dl_rollback && DL_FULL_SHA="$DL_PREV_SHA" dl_wait_healthy; then
     rc=1
     dl_err "deploy of $DL_SHORT_SHA failed; rolled back and the old version is healthy"
     if [[ $files_rc != 0 ]]; then
@@ -703,6 +721,6 @@ dl_run() {
     dl_rollback_command >&2
   fi
   DL_PHASE=""
-  trap - EXIT INT TERM HUP
+  _dl_restore_traps
   return "$rc"
 }

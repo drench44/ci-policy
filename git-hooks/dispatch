@@ -98,7 +98,7 @@ esac
 if [ "$has_policy" = 1 ]; then
   PY="${CI_POLICY_PYTHON:-python3}"
   if ! command -v "$PY" >/dev/null 2>&1; then
-    echo "ci-policy $hook: python3 not found, so the policy cannot run; refusing (fail closed)." >&2
+    echo "ci-policy $hook: $PY not found, so the policy cannot run; refusing (fail closed)." >&2
     exit 1
   fi
   if [ ! -d "$CI_POLICY_HOME/lib/ci_policy" ]; then

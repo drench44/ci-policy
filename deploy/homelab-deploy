@@ -22,13 +22,16 @@ conf_dir=$(cd "$(dirname "$conf")" && pwd -P)
 # shellcheck source=deploy-lib.sh
 source "$here/deploy-lib.sh"
 DL_GIT_DIR=$(git -C "$conf_dir" rev-parse --show-toplevel 2>/dev/null || printf '%s' "$conf_dir")
-# A config that fails to load (a syntax error half way) would leave later
-# settings, like the required-file checks, unset. Refuse instead.
-# shellcheck disable=SC1090  # the per-repo config
-if ! source "$conf"; then
-  echo "homelab-deploy: $conf failed to load; refusing to deploy" >&2
+# A config with a syntax error would load only half way, leaving later
+# settings (like the required-file checks) unset. Refuse it up front. The
+# source status itself is not checked: a valid config may end in a false test.
+if ! bash -n "$conf" 2>/dev/null; then
+  echo "homelab-deploy: $conf failed to load (syntax error); refusing to deploy" >&2
+  bash -n "$conf" >&2 || true
   exit 3
 fi
+# shellcheck disable=SC1090  # the per-repo config
+source "$conf"
 
 case "$mode" in
   deploy) dl_run; exit $? ;;

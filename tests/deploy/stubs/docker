@@ -32,9 +32,17 @@ if [[ "${args[0]}" == compose ]]; then
   exit 0
 fi
 case "${args[0]}" in
+  rmi)
+    rm -f "$S/tags/$(key "${args[1]}")"; exit 0 ;;
   inspect)
     cid="${args[3]}"; [[ -f "$S/inspect/$cid" ]] || exit 1; cat "$S/inspect/$cid"; exit 0 ;;
   image)
+    if [[ "${args[1]}" == ls ]]; then
+      # image ls --format '{{.Tag}}' <repo>: every tag stored for that repo.
+      prefix="$(key "${args[4]}")_"
+      for f in "$S/tags/$prefix"*; do [[ -e "$f" ]] && printf '%s\n' "${f##*/"$prefix"}"; done
+      exit 0
+    fi
     ref="${args[4]}"; [[ -f "$S/tags/$(key "$ref")" ]] || exit 1; cat "$S/tags/$(key "$ref")"; exit 0 ;;
   tag)
     src="${args[1]}" dst="${args[2]}"

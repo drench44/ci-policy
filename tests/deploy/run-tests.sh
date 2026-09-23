@@ -51,6 +51,7 @@ run_deploy() {
     for kv in "$@"; do eval "$kv"; done
     dl_run
     echo "RC=$?"
+    echo "TRAPS=$(trap -p EXIT)"
   } 2>&1)
   RC=$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | tail -n 1)
   CALLS=$(cat "$STUB_STATE/calls")
@@ -652,6 +653,57 @@ OUT=$(PATH="$HERE/stubs:$PATH" bash "$HERE/../../deploy/homelab-deploy" "$T/repo
 assert_eq "$RC" 3 "$OUT"
 OUT=$(PATH="$HERE/stubs:$PATH" bash "$HERE/../../deploy/homelab-deploy" "$T/repo/shallow.conf" --bogus 2>&1); RC=$?
 assert_eq "$RC" 3 "$OUT"
+teardown
+
+setup "with DL_HEALTH_COMMIT a rollback is judged against the old commit"
+echo "ok {\"ok\":true,\"commit\":\"$SHORT\"}" >"$STUB_STATE/health"
+echo "ok {\"ok\":true,\"commit\":\"$SHORT\"}" >"$STUB_STATE/health_pre"
+run_deploy DL_HEALTH_COMMIT=.commit
+assert_eq "$RC" 0 "$OUT"
+echo two >>"$T/repo/a.txt"; git -C "$T/repo" commit -qam two
+rm -f "$STUB_STATE/curl_count"
+# The new build never comes up: the old container keeps answering with the old commit.
+run_deploy DL_HEALTH_COMMIT=.commit DL_HEALTH_TIMEOUT=0
+assert_eq "$RC" 1 "$OUT"
+assert_contains "$OUT" "rolled back and the old version is healthy"
+assert_not_contains "$OUT" "does not pass the health gate"
+teardown
+
+setup "pruning keeps hand-made tags and the tag this run made"
+for t in pre-port-abc pre-radar-v4 pre-20260101T000000Z-aaaaaaaaaaaa pre-20260102T000000Z-bbbbbbbbbbbb pre-20260103T000000Z-cccccccccccc; do
+  echo sha256:X >"$STUB_STATE/tags/hub-web_$t"
+done
+run_deploy DL_SNAPSHOT_KEEP=2 DL_TAG_PUSH=0
+assert_eq "$RC" 0 "$OUT"
+left=$(for f in "$STUB_STATE/tags"/hub-web_pre-*; do printf '%s ' "${f##*/}"; done)
+assert_contains "$left" "hub-web_pre-port-abc"
+assert_contains "$left" "hub-web_pre-radar-v4"
+assert_contains "$left" "hub-web_$PRE"
+assert_contains "$left" "hub-web_pre-20260103T000000Z-cccccccccccc"
+assert_not_contains "$left" "pre-20260101T000000Z"
+assert_not_contains "$left" "pre-20260102T000000Z"
+teardown
+
+setup "the caller's own EXIT trap survives dl_run"
+run_deploy "trap 'echo caller-cleanup' EXIT" DL_TAG_PUSH=0
+assert_eq "$RC" 0
+assert_contains "$OUT" "TRAPS=trap -- 'echo caller-cleanup' EXIT"
+teardown
+
+setup "a config that ends in a false test still loads"
+cat >"$T/repo/ok.conf" <<EOF
+DL_SERVICE=hub
+DL_COMPOSE_DIR='$T/compose'
+DL_HEALTH_URL=http://box/health
+DL_HEALTH_REQUIRE=.ok
+DL_HEALTH_SETTLE=0
+DL_STATE_DIR='$T/boxstate'
+DL_TAG_PUSH=0
+[ -f /nonexistent ] && DL_SERVICES=web
+EOF
+git -C "$T/repo" add ok.conf; git -C "$T/repo" commit -qm ok
+OUT=$(PATH="$HERE/stubs:$PATH" bash "$HERE/../../deploy/homelab-deploy" "$T/repo/ok.conf" 2>&1); RC=$?
+assert_eq "$RC" 0 "$OUT"
 teardown
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"

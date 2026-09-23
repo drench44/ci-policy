@@ -195,6 +195,11 @@ def staged_blob_text(path: str, cwd: Optional[str] = None) -> Optional[str]:
     file as binary, which would hide it from the line scan. Real binaries (a NUL
     byte early on) and very large blobs return None.
     """
+    size = subprocess.run(["git", "cat-file", "-s", f":{path}"], cwd=cwd, capture_output=True,
+                          text=True)
+    if size.returncode == 0 and size.stdout.strip().isdigit() and \
+            int(size.stdout.strip()) > BLOB_SCAN_LIMIT:
+        return None
     proc = subprocess.run(["git", "cat-file", "-p", f":{path}"], cwd=cwd, capture_output=True)
     if proc.returncode != 0:
         raise RuntimeError(f"could not read the staged {path}: "
@@ -364,8 +369,8 @@ def _have_object(sha: str, cwd: Optional[str]) -> bool:
                           capture_output=True).returncode == 0
 
 
-def remote_heads(remote: str, cwd: Optional[str]) -> List[str]:
-    """Commit shas of every branch on the remote. Raises RuntimeError if unreachable."""
+def remote_heads(remote: str, cwd: Optional[str]) -> List[Tuple[str, str]]:
+    """(sha, ref) of every branch on the remote. Raises RuntimeError if unreachable."""
     try:
         proc = subprocess.run(["git", "ls-remote", "--heads", remote], cwd=cwd,
                               capture_output=True, text=True, timeout=30)
@@ -373,7 +378,8 @@ def remote_heads(remote: str, cwd: Optional[str]) -> List[str]:
         raise RuntimeError(f"git ls-remote {remote} timed out") from None
     if proc.returncode != 0:
         raise RuntimeError(f"git ls-remote {remote} failed: {proc.stderr.strip()}")
-    return [line.split()[0] for line in proc.stdout.splitlines() if line.strip()]
+    return [(line.split()[0], line.split()[1]) for line in proc.stdout.splitlines()
+            if len(line.split()) == 2]
 
 
 def judge_update(local_sha: str, remote_sha: str, branch: str, rules: Sequence[allowlist.Rule],
@@ -383,18 +389,21 @@ def judge_update(local_sha: str, remote_sha: str, branch: str, rules: Sequence[a
         return False, [f"deleting {branch} on the remote"]
     if remote_sha == ZERO:
         # Creating the branch. Fine on an empty remote (a brand-new repo). On a
-        # remote that has other branches, everything it does not have yet must
-        # pass the allowlist, the same as an update.
+        # remote that has branches, every commit not already on a PROTECTED
+        # branch there must pass the allowlist: being on some feature branch
+        # does not make a commit reviewed.
         heads = remote_heads(remote, cwd) if remote else []
         if not heads:
             return True, [f"creating {branch} on a remote with no branches yet (new repo)"]
-        missing = [h for h in heads if not _have_object(h, cwd)]
+        guarded = [sha for sha, ref in heads if protected(ref)]
+        missing = [sha for sha in guarded if not _have_object(sha, cwd)]
         if missing:
-            return False, [f"creating {branch}: the remote has branches this clone has not "
-                           f"fetched ({missing[0][:9]}); fetch first"]
-        commits = git("rev-list", "--reverse", local_sha, "--not", *heads, cwd=cwd).split()
+            return False, [f"creating {branch}: the remote has protected branches this clone "
+                           f"has not fetched ({missing[0][:9]}); fetch first"]
+        commits = git("rev-list", "--reverse", local_sha,
+                      *(["--not", *guarded] if guarded else []), cwd=cwd).split()
         if not commits:
-            return True, [f"creating {branch} at a commit the remote already has"]
+            return True, [f"creating {branch} at a commit already on a protected branch"]
         allowed, refused = check_commits(commits, rules, branch, cwd)
         if refused:
             return False, ([f"creating {branch} would land {len(refused)} commit(s) without "
