@@ -101,7 +101,16 @@ other timers, which commit as the same user outside `~/workspace`) untouched.
   shadow the global setting, so the installer moves that value to
   `ci-policy.chainHooksPath` and the dispatcher chains there. `--check` finds
   any repo that sets `core.hooksPath` again later (for example by rerunning
-  its own `scripts/install-hooks.sh`); rerun the installer to fix it.
+  its own `scripts/install-hooks.sh`, or `npm install` re-running husky in
+  lizardartist and riseyourway); rerun the installer to fix it.
+  `CI_POLICY_DEBUG=1 git hook run pre-commit` shows which repo hook a repo
+  chains to.
+
+Installed 2026-09-22 on the Mac (global) and the OMEN (`--scope ~/workspace`).
+Machine-local exception on both: weather-dashboard's vendored
+`console_live.html` is exempt from the em dash check
+(`ci-policy.emdashAllow`). Marking it `linguist-vendored` in that repo's
+`.gitattributes` would make the exception travel with the repo.
 
 ## Deploy
 
