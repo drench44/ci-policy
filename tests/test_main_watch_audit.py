@@ -59,7 +59,11 @@ class AuditRepoTests(unittest.TestCase):
     def test_no_run_at_all_and_cancelled_run_are_problems(self):
         for runs, text in [(wf_runs(), "no main-watch run exists"),
                            (wf_runs({"status": "completed", "conclusion": "cancelled"}),
-                            "was cancelled")]:
+                            "ended cancelled"),
+                           (wf_runs({"status": "completed", "conclusion": "startup_failure"}),
+                            "caller grant every permission"),
+                           (wf_runs({"status": "completed", "conclusion": "action_required"}),
+                            "ended action_required")]:
             with self.subTest(text=text):
                 routes = {f"GET {R}/activity": [push(S1, 7)],
                           f"GET {R}/commits/{S1}/status": {"statuses": []},

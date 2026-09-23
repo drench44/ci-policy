@@ -426,6 +426,20 @@ class Watcher:
                 self._pr_checks[number] = self.head_checks(head, parse_time(pr.get("merged_at")))
         return self._pr_checks[number]
 
+    def workflow_paths(self, sha: str) -> Dict[Any, str]:
+        """check suite id -> workflow file, for the Actions runs on this commit."""
+        try:
+            runs = self.api.paginate(f"/repos/{self.repo}/actions/runs", {"head_sha": sha},
+                                     item_key="workflow_runs")
+        except gh.GitHubError as e:
+            if e.status not in (403, 404):
+                raise
+            # Without `actions: read`, fall back to GitHub's own rule: newest
+            # run per check name.
+            return {}
+        return {w["check_suite_id"]: w.get("path") or "" for w in runs
+                if w.get("check_suite_id")}
+
     def head_checks(self, sha: str, merged_at: Optional[dt.datetime] = None) -> ChecksResult:
         """Judge every check on a PR head: GREEN, RED, or PENDING (still running)."""
         # Suites started by pushes to the default branch ran after the merge (a
@@ -435,6 +449,7 @@ class Watcher:
         post_merge = {s.get("id") for s in suites if s.get("head_branch") == self.branch}
         runs = self.api.paginate(f"/repos/{self.repo}/commits/{sha}/check-runs",
                                  {"filter": "latest"}, item_key="check_runs")
+        suite_path = self.workflow_paths(sha)
         run_marker = f"/actions/runs/{self.cfg.run_id}/" if self.cfg.run_id else None
         required = set(self.cfg.required_checks)
         bad: List[str] = []
@@ -448,14 +463,26 @@ class Watcher:
             if name not in seen or rank[state] > rank[seen[name]]:
                 seen[name] = state
 
+        # `filter=latest` only drops older attempts inside one check suite, and
+        # every workflow run is its own suite: a pr-policy run that failed and
+        # was re-run green after the body was fixed leaves both on the head.
+        # Like GitHub's required checks, only the newest run of each check
+        # counts, per workflow file when the Actions API names it.
+        newest: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
         for r in runs:
-            name = r.get("name") or "?"
             suite = (r.get("check_suite") or {}).get("id")
             if suite in post_merge:
                 continue
             if run_marker and run_marker in (r.get("details_url") or ""):
                 continue
             suites_with_runs.add(suite)
+            key = ((r.get("app") or {}).get("slug") or "", suite_path.get(suite, ""),
+                   r.get("name") or "?")
+            if key not in newest or (r.get("id") or 0) > (newest[key].get("id") or 0):
+                newest[key] = r
+
+        for r in newest.values():
+            name = r.get("name") or "?"
             if name not in required and self.cfg.ignore_checks.matches(name):
                 continue
             if r.get("status") != "completed":
@@ -471,9 +498,17 @@ class Watcher:
                     # a PR whose only job was skipped did not pass anything.
                     good += 1
 
+        newest_suite: Dict[str, Any] = {}
+        for s in suites:
+            path = suite_path.get(s.get("id"))
+            if path and (s.get("id") or 0) > (newest_suite.get(path) or 0):
+                newest_suite[path] = s.get("id")
         for s in suites:
             if s.get("id") in post_merge or s.get("id") in suites_with_runs:
                 continue
+            path = suite_path.get(s.get("id"))
+            if path and newest_suite.get(path) != s.get("id"):
+                continue   # a newer run of the same workflow superseded it
             app = (s.get("app") or {}).get("slug") or "an app"
             if s.get("status") == "completed":
                 if s.get("conclusion") in BAD_EMPTY_SUITE:

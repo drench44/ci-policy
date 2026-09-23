@@ -90,8 +90,13 @@ def run_state(api: gh.GitHub, w: Watched, sha: str) -> str:
     latest = max(runs, key=lambda r: (r.get("run_attempt") or 0, r.get("id") or 0))
     if latest.get("status") != "completed":
         return f"its main-watch run is still {latest.get('status')}"
-    if latest.get("conclusion") in ("cancelled", "skipped", None):
-        return f"its main-watch run was {latest.get('conclusion') or 'never finished'}"
+    # success, or failure (what a flag or a loud error produces). Anything
+    # else (cancelled, startup_failure when a caller grants too little,
+    # action_required, stale) means nothing was judged.
+    if latest.get("conclusion") not in ("success", "failure"):
+        hint = (" (does the caller grant every permission the pinned main-watch asks for?)"
+                if latest.get("conclusion") == "startup_failure" else "")
+        return f"its main-watch run ended {latest.get('conclusion') or 'without a conclusion'}{hint}"
     return "concluded"
 
 

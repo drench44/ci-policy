@@ -335,9 +335,14 @@ class VerdictTests(unittest.TestCase):
         self.assertIn("PR #5", v.reason)
 
 
+_ids = iter(range(1000, 10 ** 6))
+
+
 def run(name, status="completed", conclusion="success", suite=1, **extra):
-    r = {"name": name, "status": status, "conclusion": conclusion if status == "completed"
-         else None, "check_suite": {"id": suite}}
+    # Check run ids grow with time, like GitHub's; later calls are newer runs.
+    r = {"id": next(_ids), "name": name, "status": status,
+         "conclusion": conclusion if status == "completed" else None, "check_suite": {"id": suite},
+         "app": {"slug": "github-actions"}}
     r.update(extra)
     return r
 
@@ -382,10 +387,45 @@ class AllGreenTests(JudgeHelpers):
         self.assertEqual(v.state, "flag")
         self.assertIn("ci/legacy error", v.reason)
 
-    def test_worst_run_of_a_name_counts(self):
+    def test_newest_run_of_a_check_counts_failure_after_success(self):
         runs = [run("test", suite=1), run("test", conclusion="failure", suite=2)]
         v = self.judge(runs=runs, suites=[suite(1), suite(2)])
         self.assertEqual(v.state, "flag")
+
+    def test_failed_run_rerun_green_on_the_same_head_is_green(self):
+        # pr-policy failed, the body was fixed, the `edited` run passed: two
+        # suites on one head (seen live on cpapclarity).
+        runs = [run("policy / pr-policy", conclusion="failure", suite=1),
+                run("policy / pr-policy", conclusion="failure", suite=2),
+                run("policy / pr-policy", suite=3)]
+        v = self.judge(runs=runs, suites=[suite(1), suite(2), suite(3)])
+        self.assertEqual(v.state, "pass", v.reason)
+
+    def test_rerun_still_running_waits(self):
+        runs = [run("policy / pr-policy", conclusion="failure", suite=1),
+                run("policy / pr-policy", status="queued", suite=2)]
+        v = self.judge(runs=runs, suites=[suite(1), suite(2)])
+        self.assertEqual(v.state, "pending")
+
+    def test_same_job_name_in_two_workflows_counts_twice(self):
+        runs = [run("test", conclusion="failure", suite=1), run("test", suite=2)]
+        wf = {f"GET {R}/actions/runs": {"workflow_runs": [
+            {"check_suite_id": 1, "path": ".github/workflows/a.yml"},
+            {"check_suite_id": 2, "path": ".github/workflows/b.yml"}]}}
+        v = self.judge(runs=runs, suites=[suite(1), suite(2)], extra_routes=wf)
+        self.assertEqual(v.state, "flag")
+
+    def test_superseded_empty_suite_of_the_same_workflow_is_ignored(self):
+        wf = {f"GET {R}/actions/runs": {"workflow_runs": [
+            {"check_suite_id": 1, "path": ".github/workflows/ci.yml"},
+            {"check_suite_id": 2, "path": ".github/workflows/ci.yml"}]}}
+        v = self.judge(runs=[run("test", suite=2)],
+                       suites=[suite(1, conclusion="failure"), suite(2)], extra_routes=wf)
+        self.assertEqual(v.state, "pass", v.reason)
+
+    def test_actions_api_error_other_than_forbidden_is_raised(self):
+        with self.assertRaises(gh.GitHubError):
+            self.judge(extra_routes={f"GET {R}/actions/runs": gh.GitHubError("down", 502)})
 
     def test_workflow_that_could_not_start_is_red(self):
         suites = [suite(1), suite(2, conclusion="startup_failure")]
