@@ -1,16 +1,31 @@
 #!/usr/bin/env bash
-# Fake curl. The deploy's pre-restart probe (DL_PROBE=pre) reads
-# $STUB_STATE/health_pre if present, else fails. Every other call consumes the
+# Fake curl.
+# The health URL: the deploy's pre-restart probes (DL_PROBE=pre) consume the
+# lines of $STUB_STATE/health_pre (the last repeats), and fail if it is absent. Every other call consumes the
 # next line of $STUB_STATE/health ("ok <body>" or "fail"); the last line repeats.
+# A URL ending in /live is the liveness URL: pre probes read live_pre, every
+# other call the next line of live; both default to "ok {}" when absent.
 S="$STUB_STATE"
 printf 'curl %s\n' "$*" >>"$S/calls"
-if [[ "${DL_PROBE:-}" == pre ]]; then
-  line=$(cat "$S/health_pre" 2>/dev/null || echo fail)
-else
-  n=$(( $(cat "$S/curl_count" 2>/dev/null || echo 0) + 1 )); echo "$n" >"$S/curl_count"
-  total=$(wc -l <"$S/health" | tr -d ' ')
+url="${*: -1}"
+next_line() {  # $1 = sequence file, $2 = its counter file, $3 = default line
+  [[ -f "$1" ]] || { printf '%s' "$3"; return; }
+  local n total
+  n=$(( $(cat "$2" 2>/dev/null || echo 0) + 1 )); echo "$n" >"$2"
+  total=$(wc -l <"$1" | tr -d ' ')
   (( n > total )) && n=$total
-  line=$(sed -n "${n}p" "$S/health")
+  sed -n "${n}p" "$1"
+}
+if [[ "$url" == */live ]]; then
+  if [[ "${DL_PROBE:-}" == pre ]]; then
+    line=$(cat "$S/live_pre" 2>/dev/null || echo 'ok {}')
+  else
+    line=$(next_line "$S/live" "$S/live_count" 'ok {}')
+  fi
+elif [[ "${DL_PROBE:-}" == pre ]]; then
+  line=$(next_line "$S/health_pre" "$S/pre_count" fail)
+else
+  line=$(next_line "$S/health" "$S/curl_count" fail)
 fi
 case "$line" in
   ok\ *) printf '%s' "${line#ok }"; exit 0 ;;

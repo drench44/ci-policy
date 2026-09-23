@@ -1,7 +1,7 @@
 # shellcheck shell=bash
 # deploy-lib.sh: shared homelab docker compose deploy with a real health gate
 # and automatic rollback. Canonical source: drench44/ci-policy deploy/deploy-lib.sh
-DL_LIB_VERSION="2.1.1"
+DL_LIB_VERSION="2.2.0"
 #
 # Most repos should not source this directly: write a small config file and
 # run deploy/homelab-deploy <config> (see deploy/example.deploy.conf).
@@ -33,15 +33,40 @@ DL_LIB_VERSION="2.1.1"
 #   7. Healthy: record the new commit in the box state file, create + push
 #      git tag deploy/<service>/<UTC time>-<sha>.
 #      Not healthy: restore the snapshot, retag the pre- image back onto
-#      the compose image name, recreate without building, check health
-#      again, and create + push git tag failed-deploy/<service>/<time>-<sha>.
+#      the compose image name, recreate without building, judge the old
+#      version again (see "Judging a rollback"), and create + push git tag
+#      failed-deploy/<service>/<time>-<sha>.
+#   Every outcome is also appended to deploys.log in the box state dir, so
+#   the box keeps the record even where git tags stay local (DL_TAG_PUSH).
+#
+# Judging a rollback. Before anything changes, the version running now is
+# probed with the full gate. A rollback is then judged by what THAT version
+# proved, never by more:
+#   - it passed the full gate: the rollback must pass the full gate again
+#     (the commit check uses the box's deployed-commit record);
+#   - it did not (a version from before the gate, a deploy record it never
+#     had, a source already down): the rollback must answer liveness
+#     (DL_LIVENESS_URL), plus dl_health_extra if that passed before too.
+#   The log says which gate judged it. SERVICE IS DOWN is printed only when
+#   liveness itself does not answer after the rollback.
+#   (2026-09-23: the first real family-hub deploy rolled back a hub with no
+#   deploy record, judged it by the new gate it could never pass, waited
+#   330 s and printed SERVICE IS DOWN while the wall was up and serving.)
 #
 # Exit codes of dl_run:
 #   0  deployed, healthy, tags pushed
-#   1  deploy was unhealthy (or dl_sync failed), rolled back, old version healthy
-#   2  deploy was unhealthy and the rollback failed or was impossible: DOWN
+#   1  deploy was unhealthy (or dl_sync failed), rolled back, and the old
+#      version passes what it passed before the deploy
+#   2  DOWN: after the rollback (or with nothing to roll back to) liveness
+#      does not answer
 #   3  config or precondition problem; nothing was restarted (box files restored)
 #   4  deployed and healthy, but a git tag could not be created or pushed
+#   5  up but not as intended: the service answers liveness, but the rollback
+#      is incomplete (a service had no rollback point, the files could not be
+#      put back) or the old version fails a check it passed before the deploy
+#   6  nothing restarted, but dl_sync's files could not be taken back off the
+#      box: the running containers are fine, the NEXT restart is not. Put the
+#      files back by hand (the message says how) before anything restarts.
 #
 # Settings:
 #   DL_SERVICE          required. Name used in tags, state and messages.
@@ -70,6 +95,13 @@ DL_LIB_VERSION="2.1.1"
 #   DL_HEALTH_SHALLOW_OK=1  allow a gate with none of the three above (not advised).
 #   DL_HEALTH_FROM      "local" (curl here, default) or "remote" (curl on DL_REMOTE,
 #                       for services bound to the box's loopback only).
+#   DL_LIVENESS_URL     URL that answers 2xx whenever the process is up (for
+#                       example /health), the least a rolled-back version must
+#                       prove. Default: DL_HEALTH_URL answering 2xx at all.
+#                       Fetched the same way as DL_HEALTH_URL (DL_HEALTH_FROM).
+#   DL_PRE_PROBE_TRIES  tries of the full gate on the version running before the
+#                       deploy (DL_HEALTH_INTERVAL apart) before a rollback to
+#                       it is judged by liveness instead. Default 3.
 #   DL_HEALTH_TIMEOUT   seconds to wait for healthy. Default 120.
 #   DL_HEALTH_INTERVAL  seconds between polls. Default 5.
 #   DL_REQUIRE_FILES    files (relative to DL_COMPOSE_DIR) that must exist and be
@@ -86,7 +118,22 @@ DL_LIB_VERSION="2.1.1"
 #   DL_GIT_DIR          repo being deployed. Default: current directory.
 #   DL_SHA              optional; if set it must equal HEAD (the checkout is what ships).
 #   DL_GIT_REMOTE       where tags are pushed. Default origin.
-#   DL_TAG_PUSH         1 = create and push git tags (default), 0 = skip.
+#   DL_TAG_PUSH         1 = create and push git tags (default); local = record
+#                       them in DL_GIT_DIR as refs/deploy-history/<name>, not
+#                       as tags (a release's --follow-tags push would publish
+#                       tags), never pushed; 0 = no tags.
+#                       Pushing is refused (exit 3 before anything changes)
+#                       unless the remote is known to be private: a GitHub
+#                       remote is asked (gh api) and must be private; a local
+#                       path or file:// URL counts as private; any other host
+#                       needs DL_TAG_REMOTE_PRIVATE=1. A deploy history does
+#                       not belong in a public repo, so a public repo's config
+#                       sets DL_TAG_PUSH=local (or, only when that is really
+#                       intended, DL_TAG_PUSH_PUBLIC=1). Every push URL of the
+#                       remote is checked (pushurl, pushInsteadOf), and only
+#                       a deploy checks (--health makes no tags).
+#   DL_TAG_PUSH_PUBLIC=1    allow pushing tags to a PUBLIC remote (not advised).
+#   DL_TAG_REMOTE_PRIVATE=1 the remote is private but not on GitHub.
 #   DL_ALLOW_DIRTY      1 = allow deploying with uncommitted changes. Default 0.
 # Hooks:
 #   dl_sync             optional shell function, run after the rollback point is
@@ -100,7 +147,10 @@ DL_LIB_VERSION="2.1.1"
 #                       the reason. It must bound its own run time (ssh
 #                       ConnectTimeout, timeout -k): the poll waits for it. It
 #                       adds to the gate, it never replaces it: a config with
-#                       only this hook is still refused as shallow.
+#                       only this hook is still refused as shallow. When the
+#                       version running before a deploy fails the JSON gate,
+#                       the hook is run on its own (with $1 empty) to learn
+#                       whether a rollback to that version must pass it.
 
 dl_log()  { printf '[deploy %s] %s\n' "${DL_SERVICE:-?}" "$*" >&2; }
 dl_warn() { printf '[deploy %s] WARNING: %s\n' "${DL_SERVICE:-?}" "$*" >&2; }
@@ -300,6 +350,66 @@ dl_preflight() {
 }
 
 
+# Tags pushed to DL_GIT_REMOTE must never land in a public repo by accident:
+# a deploy history (every deploy, failure and rollback of a house service,
+# with times) is house data. Checked in preflight, so a refused push stops
+# the deploy before anything changes. (2026-09-23: the first family-hub
+# deploy pushed a failed-deploy tag to the PUBLIC engine repo.)
+_dl_check_tag_remote() {
+  case "${DL_TAG_PUSH:-1}" in
+    0|local) return 0 ;;
+    1) ;;
+    *) dl_err "DL_TAG_PUSH must be 1, local or 0, not '${DL_TAG_PUSH}'"; return 1 ;;
+  esac
+  [[ "${DL_TAG_PUSH_PUBLIC:-0}" == 1 ]] && return 0
+  local gitdir="${DL_GIT_DIR:-.}" remote="${DL_GIT_REMOTE:-origin}" urls url
+  # Where a push really goes: the push URL(s) (pushurl, pushInsteadOf), not
+  # the fetch URL. Every one of them must be private.
+  urls=$(git -C "$gitdir" remote get-url --push --all "$remote" 2>/dev/null) || urls=""
+  if [[ -z "$urls" ]]; then
+    dl_err "DL_GIT_REMOTE '$remote' is not a remote of $gitdir (or set DL_TAG_PUSH=local)"
+    return 1
+  fi
+  while IFS= read -r url; do
+    [[ -n "$url" ]] || continue
+    _dl_url_is_private "$url" || return 1
+  done <<<"$urls"
+  return 0
+}
+
+# One push URL: 0 when it is known to be private, else says why and returns 1.
+_dl_url_is_private() {
+  local url="$1" slug vis
+  case "$url" in
+    /*|./*|../*|file://*) return 0 ;;
+  esac
+  if [[ "$url" =~ github\.com[:/]([^/]+/[^/]+)$ ]]; then
+    slug="${BASH_REMATCH[1]%.git}"
+    if ! command -v gh >/dev/null 2>&1; then
+      dl_err "cannot tell whether $slug is private (gh is not installed), so its deploy tags will not be pushed. Install gh, or set DL_TAG_PUSH=local (the record stays in this clone)."
+      return 1
+    fi
+    if ! vis=$(gh api "repos/$slug" --jq .private 2>&1); then
+      dl_err "cannot tell whether $slug is private (gh api: ${vis:0:200}), so its deploy tags will not be pushed. Fix gh auth, or set DL_TAG_PUSH=local."
+      return 1
+    fi
+    if [[ "$vis" == true ]]; then
+      return 0
+    fi
+    if [[ "$vis" == false ]]; then
+      dl_err "$slug is PUBLIC: deploy tags (rollback-point/, deploy/, failed-deploy/) would publish this service's deploy history. Set DL_TAG_PUSH=local in the config (the record stays in this clone; the box keeps deploys.log), or DL_TAG_PUSH_PUBLIC=1 if publishing them is intended."
+      return 1
+    fi
+    dl_err "gh api repos/$slug answered '${vis:0:80}' for .private, not true or false; not pushing tags there. Set DL_TAG_PUSH=local."
+    return 1
+  fi
+  if [[ "${DL_TAG_REMOTE_PRIVATE:-0}" == 1 ]]; then
+    return 0
+  fi
+  dl_err "cannot tell whether $url is private, so deploy tags will not be pushed there. Set DL_TAG_REMOTE_PRIVATE=1 if it is, or DL_TAG_PUSH=local."
+  return 1
+}
+
 # The state dir expression, expanded by the shell that runs dl_sh.
 _dl_state_dir() {
   if [[ -n "${DL_STATE_DIR:-}" ]]; then
@@ -324,6 +434,16 @@ dl_read_deployed_sha() {
 dl_write_deployed_sha() {
   dl_sh "d=\"$(_dl_state_dir)\"; mkdir -p \"\$d\" && printf '%s\n' \"\$1\" >\"\$d/deployed-sha.tmp\" && mv \"\$d/deployed-sha.tmp\" \"\$d/deployed-sha\"" \
     "$DL_FULL_SHA"
+}
+
+# Append one line to deploys.log in the box state dir. Best effort: the log
+# is a record, never a reason to fail a deploy, but a failure is said.
+dl_log_event() {
+  local line
+  line="$(date -u +%Y-%m-%dT%H:%M:%SZ) $DL_SERVICE $* stamp=${DL_STAMP:-?}"
+  dl_sh "d=\"$(_dl_state_dir)\"; mkdir -p \"\$d\" && printf '%s\n' \"\$1\" >>\"\$d/deploys.log\"" "$line" \
+    || dl_warn "could not append to $(_dl_state_dir)/deploys.log on the box: $line"
+  return 0
 }
 
 # Tag every service's running image as <repo>:pre-<stamp>-<sha>. Each run tags
@@ -494,24 +614,68 @@ def bad: . == null or . == false or . == "";
   printf '%s' "$prog"
 }
 
-# One health probe. Prints the reason on failure.
-dl_health_once() {
+# GET a URL (here, or on DL_REMOTE with DL_HEALTH_FROM=remote). Prints the
+# body; on failure prints "request failed: <why>" and returns 1.
+_dl_fetch() {
   # stderr is kept apart from the body: a curl or ssh warning must never be
   # read as the response.
-  local body errf ok=1
+  local url="$1" body errf ok=1
   errf=$(mktemp "${TMPDIR:-/tmp}/dl-health.XXXXXX") || { printf 'mktemp failed'; return 1; }
   if [[ "${DL_HEALTH_FROM:-local}" == remote ]]; then
     body=$(ssh -n -o BatchMode=yes -o LogLevel=ERROR "$DL_REMOTE" \
-      "curl -fsS --max-time 10 $(printf '%q' "$DL_HEALTH_URL")" 2>"$errf") || ok=0
+      "curl -fsS --max-time 10 $(printf '%q' "$url")" 2>"$errf") || ok=0
   else
-    body=$(curl -fsS --max-time 10 "$DL_HEALTH_URL" 2>"$errf") || ok=0
+    body=$(curl -fsS --max-time 10 "$url" 2>"$errf") || ok=0
   fi
   if [[ $ok == 0 ]]; then
-    printf 'request failed: %s' "$(head -c 200 "$errf")"
+    printf 'request failed: %s' "$(head -c 200 "$errf" | tr '\n' ' ')"
     rm -f "$errf"
     return 1
   fi
   rm -f "$errf"
+  printf '%s' "$body"
+}
+
+# Run dl_health_extra once in a subshell with the body as $1. Prints the
+# reason on failure.
+_dl_extra_once() {
+  local out rc=0
+  # stderr is kept with stdout because that is where a failing check says why.
+  out=$(dl_health_extra "${1:-}" 2>&1) || rc=$?
+  (( rc == 0 )) && return 0
+  out=$(printf '%s\n' "$out" | grep -v '^[[:space:]]*$' | tail -n 3 | tr '\n' ' ')
+  printf 'dl_health_extra failed (exit %s): %s' "$rc" "$(_dl_trim "${out:0:400}")"
+  return 1
+}
+
+# The liveness URL (see DL_LIVENESS_URL).
+_dl_liveness_url() { printf '%s' "${DL_LIVENESS_URL:-$DL_HEALTH_URL}"; }
+
+# One liveness probe: the process answers 2xx. Prints the reason on failure.
+dl_live_once() {
+  local url out
+  url=$(_dl_liveness_url)
+  if ! out=$(_dl_fetch "$url"); then
+    printf 'liveness %s: %s' "$url" "$out"
+    return 1
+  fi
+  return 0
+}
+
+# One probe of what a rolled-back version must prove when it did not pass
+# the full gate before the deploy: liveness, plus dl_health_extra when
+# DL_ROLLBACK_EXTRA=1 (it passed before). Prints the reason on failure.
+dl_rollback_live_once() {
+  dl_live_once || return 1
+  [[ "${DL_ROLLBACK_EXTRA:-0}" == 1 ]] || return 0
+  _dl_extra_once ""
+}
+
+# One health probe. Prints the reason on failure. Returns 1 when the request
+# or the JSON gate fails, 2 when only dl_health_extra fails.
+dl_health_once() {
+  local body
+  body=$(_dl_fetch "$DL_HEALTH_URL") || { printf '%s' "$body"; return 1; }
   if ! printf '%s' "$body" | jq -e . >/dev/null 2>&1; then
     printf 'response is not JSON: %s' "${body:0:200}"
     return 1
@@ -527,33 +691,31 @@ dl_health_once() {
     return 1
   fi
   declare -F dl_health_extra >/dev/null || return 0
-  # A subshell, so the hook cannot change the deploy's own variables or traps;
-  # stderr is kept with stdout because that is where a failing check says why.
-  local out rc=0
-  out=$(dl_health_extra "$body" 2>&1) || rc=$?
-  (( rc == 0 )) && return 0
-  out=$(printf '%s\n' "$out" | grep -v '^[[:space:]]*$' | tail -n 3 | tr '\n' ' ')
-  printf 'dl_health_extra failed (exit %s): %s' "$rc" "$(_dl_trim "${out:0:400}")"
-  return 1
+  [[ "${DL_SKIP_EXTRA:-0}" == 1 ]] && return 0
+  # A subshell, so the hook cannot change the deploy's own variables or traps.
+  _dl_extra_once "$body" || return 2
+  return 0
 }
 
-# Poll until healthy or DL_HEALTH_TIMEOUT seconds pass, then check once more
-# after DL_HEALTH_SETTLE seconds (an app that answers and then crash-loops).
+# Poll a probe (default dl_health_once) until it passes or DL_HEALTH_TIMEOUT
+# seconds pass, then check once more after DL_HEALTH_SETTLE seconds (an app
+# that answers and then crash-loops). $2 names the gate in the log.
 dl_wait_healthy() {
+  local probe="${1:-dl_health_once}" what="${2:-$DL_HEALTH_URL}"
   local timeout="${DL_HEALTH_TIMEOUT:-120}" interval="${DL_HEALTH_INTERVAL:-5}"
   local settle="${DL_HEALTH_SETTLE:-10}"
   local start=$SECONDS reason tries=0
   while :; do
     tries=$((tries + 1))
-    if reason=$(dl_health_once); then
+    if reason=$("$probe"); then
       if [[ "$settle" != 0 && "$settle" != 0.0 ]]; then
         sleep "$settle"
-        if ! reason=$(dl_health_once); then
+        if ! reason=$("$probe"); then
           dl_err "healthy once, then not healthy ${settle}s later: $reason"
           return 1
         fi
       fi
-      dl_log "healthy after $tries check(s): $DL_HEALTH_URL"
+      dl_log "healthy after $tries check(s): $what"
       return 0
     fi
     if (( SECONDS - start >= timeout )); then
@@ -601,11 +763,26 @@ dl_rollback() {
 
 # Create and push an annotated tag. Usage: dl_git_tag <tag> <commit> <message>
 dl_git_tag() {
-  [[ "${DL_TAG_PUSH:-1}" == 1 ]] || return 0
+  [[ "${DL_TAG_PUSH:-1}" == 0 ]] && return 0
   local gitdir="${DL_GIT_DIR:-.}" tag="$1" commit="$2" msg="$3"
+  if [[ "${DL_TAG_PUSH:-1}" == local ]]; then
+    # NOT a tag: a release's `--follow-tags` push (how the public engines
+    # release) would publish an annotated tag on a pushed commit, and
+    # `--tags` any tag. A ref under refs/deploy-history/ is left alone by
+    # every default push. List them: git for-each-ref refs/deploy-history
+    local full obj
+    full=$(git -C "$gitdir" rev-parse --verify "$commit^{commit}" 2>/dev/null) \
+      && obj=$(printf 'object %s\ntype commit\ntag %s\ntagger homelab-deploy <homelab-deploy@localhost> %s +0000\n\n%s\n' \
+                 "$full" "$tag" "$(date +%s)" "$msg" | git -C "$gitdir" mktag 2>/dev/null) \
+      && git -C "$gitdir" update-ref "refs/deploy-history/$tag" "$obj" \
+      || { dl_err "could not record refs/deploy-history/$tag in $gitdir"; return 1; }
+    dl_log "recorded refs/deploy-history/$tag in $gitdir (DL_TAG_PUSH=local: a private ref, never pushed)"
+    return 0
+  fi
   git -C "$gitdir" tag -a "$tag" "$commit" -m "$msg" \
     || { dl_err "could not create git tag $tag"; return 1; }
-  git -C "$gitdir" push -q "${DL_GIT_REMOTE:-origin}" "refs/tags/$tag" \
+  # Never a credential prompt in the middle of a deploy: fail, and say so.
+  GIT_TERMINAL_PROMPT=0 git -C "$gitdir" push -q "${DL_GIT_REMOTE:-origin}" "refs/tags/$tag" </dev/null \
     || { dl_err "created $tag but could not push it; run: git push ${DL_GIT_REMOTE:-origin} refs/tags/$tag"; return 1; }
   dl_log "git tag $tag"
   return 0
@@ -614,7 +791,7 @@ dl_git_tag() {
 # Tag the commit the box was running before this deploy, so git records the
 # rollback point. Unknown (first deploy with this library) is a warning.
 dl_tag_rollback_point() {
-  [[ "${DL_TAG_PUSH:-1}" == 1 ]] || return 0
+  [[ "${DL_TAG_PUSH:-1}" == 0 ]] && return 0
   local prev="${DL_PREV_SHA:-}" gitdir="${DL_GIT_DIR:-.}"
   if [[ "${DL_PREV_READ_FAILED:-0}" == 1 ]]; then
     dl_warn "could not read the box's deployed-commit record, so git gets no rollback-point tag this time"
@@ -633,14 +810,16 @@ dl_tag_rollback_point() {
 }
 
 # Undo files after a failure before anything restarted. 0 when the box is
-# back as it was; 2 when it could not be put back.
+# back as it was; 6 when it could not be put back (nothing restarted, the old
+# containers still run, but the files on the box are not what they run: the
+# next restart would start on them).
 _dl_abort_before_restart() {
   local rc=0
   dl_restore_snapshot || rc=$?
   case $rc in
     0) return 0 ;;
-    2) dl_err "nothing was restarted, but dl_sync's changes are still in $DL_COMPOSE_DIR (snapshots are off)"; return 2 ;;
-    *) dl_err "nothing was restarted, but the compose directory may be half-synced; restore it by hand"; return 2 ;;
+    2) dl_err "nothing was restarted, but dl_sync's changes are still in $DL_COMPOSE_DIR (snapshots are off)"; return 6 ;;
+    *) dl_err "nothing was restarted, but the compose directory may be half-synced; restore it by hand"; return 6 ;;
   esac
 }
 
@@ -666,10 +845,77 @@ _dl_on_exit() {
   exit "$rc"
 }
 
+# Probe the version running now, before anything changes, and decide what a
+# rollback to it must prove (see "Judging a rollback" at the top). Sets
+# DL_ROLLBACK_GATE (full, json or live), DL_ROLLBACK_EXTRA (0/1: in live mode,
+# dl_health_extra passed too) and DL_PRE_LIVE (0/1: it answered liveness).
+dl_probe_running() {
+  DL_ROLLBACK_GATE=full DL_ROLLBACK_EXTRA=0 DL_PRE_LIVE=1
+  local reason rc try tries="${DL_PRE_PROBE_TRIES:-3}"
+  # The old version reports the old commit, so the commit check uses that
+  # one (none at all when the box has no deployed-commit record yet). A
+  # weaker rollback gate is chosen only when every try fails: one curl
+  # timeout or a fresh field between updates must not lower the bar.
+  for (( try = 1; try <= tries; try++ )); do
+    rc=0
+    reason=$(DL_PROBE=pre DL_FULL_SHA="$DL_PREV_SHA" dl_health_once) || rc=$?
+    (( rc == 0 || try == tries )) && break
+    sleep "${DL_HEALTH_INTERVAL:-5}"
+  done
+  if (( rc == 0 )); then
+    dl_log "the version running now passes the full health gate, so a rollback must pass it again"
+    return 0
+  fi
+  dl_warn "the version running now does not pass the health gate ($tries tries): $reason"
+  if (( rc == 2 )); then
+    # The JSON gate passed; only dl_health_extra failed.
+    DL_ROLLBACK_GATE=json
+  else
+    DL_ROLLBACK_GATE=live
+    if ! reason=$(DL_PROBE=pre dl_live_once); then
+      DL_PRE_LIVE=0
+      dl_warn "it does not answer liveness either: $reason"
+    elif declare -F dl_health_extra >/dev/null; then
+      if reason=$(DL_PROBE=pre DL_FULL_SHA="$DL_PREV_SHA" _dl_extra_once ""); then
+        DL_ROLLBACK_EXTRA=1
+      else
+        dl_warn "its dl_health_extra check fails too: $reason"
+      fi
+    fi
+  fi
+  dl_warn "so if this deploy fails, its rollback is judged by $(_dl_rollback_gate_name), what that version can prove, not by the full gate"
+  return 0
+}
+
+# The gate a rollback is judged by, in words.
+_dl_rollback_gate_name() {
+  case "${DL_ROLLBACK_GATE:-full}" in
+    full) printf 'the full health gate (%s)' "$DL_HEALTH_URL" ;;
+    json) printf 'the health gate without dl_health_extra (%s)' "$DL_HEALTH_URL" ;;
+    live) printf 'liveness (%s)' "$(_dl_liveness_url)"
+          [[ "${DL_ROLLBACK_EXTRA:-0}" == 1 ]] && printf ' plus dl_health_extra'
+          ;;
+  esac
+  return 0
+}
+
+# Wait for the rolled-back version to pass what it passed before the deploy.
+_dl_judge_rollback() {
+  local name
+  name=$(_dl_rollback_gate_name)
+  case "${DL_ROLLBACK_GATE:-full}" in
+    full) DL_FULL_SHA="$DL_PREV_SHA" dl_wait_healthy dl_health_once "$name" ;;
+    json) DL_FULL_SHA="$DL_PREV_SHA" DL_SKIP_EXTRA=1 dl_wait_healthy dl_health_once "$name" ;;
+    live) DL_FULL_SHA="$DL_PREV_SHA" dl_wait_healthy dl_rollback_live_once "$name" ;;
+  esac
+}
+
 dl_run() {
   local tag_rc=0 rc
   DL_PHASE=""
   dl_preflight || return 3
+  # Only a deploy makes tags (--health does not), so only a deploy asks.
+  _dl_check_tag_remote || return 3
   local services
   services=$(dl_services) || { dl_err "could not list compose services"; return 3; }
   dl_log "deploying $DL_SHORT_SHA (services: ${services//$'\n'/ }) with deploy-lib $DL_LIB_VERSION"
@@ -677,29 +923,30 @@ dl_run() {
   # check while probing the old version).
   DL_PREV_SHA="" DL_PREV_READ_FAILED=0
   DL_PREV_SHA=$(dl_read_deployed_sha) || { DL_PREV_SHA=""; DL_PREV_READ_FAILED=1; }
-  # A gate that cannot even read the current version is worth knowing about
-  # before anything changes (for example curl missing on the box). The old
-  # version reports the old commit, so the commit check uses that one.
-  local now_reason
-  if ! now_reason=$(DL_PROBE=pre DL_FULL_SHA="$DL_PREV_SHA" dl_health_once); then
-    dl_warn "the version running now does not pass the health gate: $now_reason"
-  fi
+  # What the version running now proves decides how a rollback is judged.
+  # A gate that cannot even read it is worth knowing about before anything
+  # changes too (for example curl missing on the box).
+  dl_probe_running
   dl_record_pre || { dl_err "stopping before deploy: could not record rollback points"; return 3; }
   dl_snapshot || { dl_err "stopping before deploy: could not snapshot the compose directory"; return 3; }
   dl_tag_rollback_point || tag_rc=4
 
+  local abort_rc
   if declare -F dl_sync >/dev/null; then
     dl_log "running dl_sync"
     if ! dl_sync; then
       dl_err "dl_sync failed; putting the files back, nothing was restarted"
-      _dl_abort_before_restart && return 1
-      return 2
+      abort_rc=0; _dl_abort_before_restart || abort_rc=$?
+      dl_log_event "sync-failed sha=$DL_FULL_SHA prev=${DL_PREV_SHA:-none} rc=$(( abort_rc ? abort_rc : 1 ))"
+      (( abort_rc == 0 )) && return 1
+      return "$abort_rc"
     fi
   fi
   if ! dl_check_required; then
     dl_err "refusing to restart with required files or settings missing; putting the files back"
-    _dl_abort_before_restart && return 3
-    return 2
+    abort_rc=0; _dl_abort_before_restart || abort_rc=$?
+    (( abort_rc == 0 )) && return 3
+    return "$abort_rc"
   fi
 
   DL_SAVED_TRAPS=$(trap -p EXIT INT TERM HUP)
@@ -715,6 +962,7 @@ dl_run() {
       dl_git_tag "deploy/$DL_SERVICE/$DL_STAMP-$DL_SHORT_SHA" "$DL_FULL_SHA" \
         "Deployed $DL_SERVICE at $DL_SHORT_SHA ($DL_STAMP), healthy." || tag_rc=4
       dl_prune_pre_tags
+      dl_log_event "deployed sha=$DL_FULL_SHA prev=${DL_PREV_SHA:-none} images=$DL_PRE_TAG rc=$tag_rc"
       dl_log "deploy OK. To roll back to what ran before:"
       dl_rollback_command >&2
       return "$tag_rc"
@@ -726,34 +974,61 @@ dl_run() {
   DL_PHASE=rolling-back
   dl_git_tag "failed-deploy/$DL_SERVICE/$DL_STAMP-$DL_SHORT_SHA" "$DL_FULL_SHA" \
     "Deploy of $DL_SERVICE at $DL_SHORT_SHA ($DL_STAMP) was unhealthy and rolled back." || true
+  local live_reason gate_name
+  gate_name=$(_dl_rollback_gate_name)
   if [[ -z "${DL_PRE:-}" ]]; then
     dl_restore_snapshot || true
     DL_PHASE=""
     _dl_restore_traps
-    dl_err "no image rollback point was recorded, so nothing can be rolled back. SERVICE IS DOWN."
+    if live_reason=$(dl_live_once); then
+      dl_err "no image rollback point was recorded, so nothing was rolled back: the NEW build still runs and failed the gate. It answers liveness ($(_dl_liveness_url)), so it is up but not healthy."
+      dl_log_event "failed-deploy sha=$DL_FULL_SHA prev=${DL_PREV_SHA:-none} rollback=none result=up-unhealthy rc=5"
+      return 5
+    fi
+    dl_err "no image rollback point was recorded, so nothing can be rolled back, and liveness does not answer ($live_reason). SERVICE IS DOWN."
+    dl_log_event "failed-deploy sha=$DL_FULL_SHA prev=${DL_PREV_SHA:-none} rollback=none result=down rc=2"
     return 2
   fi
   dl_warn "rolling back to the files and images recorded before this deploy"
   local files_rc=0
   dl_restore_snapshot || files_rc=$?
+  dl_log "judging the rollback by $gate_name"
   rc=2
-  # After the rollback the old version answers, with the old commit.
-  if dl_rollback && DL_FULL_SHA="$DL_PREV_SHA" dl_wait_healthy; then
-    rc=1
-    dl_err "deploy of $DL_SHORT_SHA failed; rolled back and the old version is healthy"
-    if [[ $files_rc != 0 ]]; then
+  local result
+  if ! dl_rollback; then
+    if live_reason=$(dl_live_once); then
+      rc=5 result=rollback-incomplete
+      dl_err "the rollback did not complete (above), but something answers liveness ($(_dl_liveness_url)). Finish it by hand:"
+    else
+      rc=2 result=down
+      dl_err "ROLLBACK FAILED and liveness does not answer ($live_reason). SERVICE IS DOWN. Run this by hand, then check $(_dl_liveness_url):"
+    fi
+    dl_rollback_command >&2
+  elif _dl_judge_rollback; then
+    rc=1 result=rolled-back
+    dl_err "deploy of $DL_SHORT_SHA failed; rolled back, and the old version passes $gate_name"
+    if [[ $files_rc == 1 ]]; then
       dl_err "BUT the compose directory was not restored; the old images run with the new files. Check it by hand."
+      rc=5 result=rolled-back-files-not-restored
     fi
     if [[ -n "${DL_UNRECORDED:-}" ]]; then
       dl_err "BUT these services had no rollback point and still run the new build: $DL_UNRECORDED"
-      rc=2
+      rc=5 result=rolled-back-partly
     fi
     dl_log "the rollback ran:"
     dl_rollback_command >&2
+  elif live_reason=$(dl_live_once); then
+    rc=5 result=rolled-back-degraded
+    dl_err "ROLLED BACK and the old version is UP (liveness $(_dl_liveness_url) answers), but it does not pass $gate_name, which it passed before this deploy. It is running degraded; the reason is above. The rollback ran:"
+    dl_rollback_command >&2
   else
-    dl_err "ROLLBACK FAILED. SERVICE IS DOWN. Run this by hand, then check $DL_HEALTH_URL:"
+    rc=2 result=down
+    dl_err "ROLLBACK FAILED. SERVICE IS DOWN: $live_reason"
+    [[ "${DL_PRE_LIVE:-1}" == 0 ]] && dl_err "(it did not answer liveness before this deploy either)"
+    dl_err "Run this by hand, then check $(_dl_liveness_url):"
     dl_rollback_command >&2
   fi
+  dl_log_event "failed-deploy sha=$DL_FULL_SHA prev=${DL_PREV_SHA:-none} images=$DL_PRE_TAG judged-by=$DL_ROLLBACK_GATE${DL_ROLLBACK_EXTRA:+/extra=$DL_ROLLBACK_EXTRA} result=$result rc=$rc"
   DL_PHASE=""
   _dl_restore_traps
   return "$rc"
