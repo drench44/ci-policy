@@ -249,6 +249,8 @@ _dl_split_image() {
 # timescale/timescaledb:pre-..., and a rollback would have retagged the
 # database's image name onto the old web image.
 # --no-env-resolution keeps env_file values (secrets) out of the output.
+# (Compose v5.4 on garage-utility and v5.5 on the OMEN have it; a compose
+# without it fails here, before anything restarts.)
 dl_image_for() {
   local svc="$1" json out
   json=$(dl_compose config --no-env-resolution --format json "$svc") \
