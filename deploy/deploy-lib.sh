@@ -63,6 +63,8 @@ DL_LIB_VERSION="2.1.1"
 #                       it must match the deployed commit (full or short sha).
 #                       The only proof the NEW version answered; set it if the
 #                       app can report its commit.
+#   DL_HEALTH_PROBLEMS  jq path to the app's own list of problems, added to a
+#                       failed check's reason. Default .problems; absent = nothing.
 #   DL_HEALTH_SETTLE    seconds to wait after the first healthy answer, then
 #                       check again (catches crash loops). Default 10.
 #   DL_HEALTH_SHALLOW_OK=1  allow a gate with none of the three above (not advised).
@@ -514,9 +516,14 @@ dl_health_once() {
     printf 'response is not JSON: %s' "${body:0:200}"
     return 1
   fi
-  local why
+  local why said
   if ! why=$(printf '%s' "$body" | jq -e "$(_dl_health_program)" 2>&1 >/dev/null); then
-    printf '%s' "${why:-health program failed}"
+    # The gate names only its first failed check; the app's own account of
+    # what is wrong (DL_HEALTH_PROBLEMS, default .problems) says why.
+    said=$(printf '%s' "$body" | jq -r "(${DL_HEALTH_PROBLEMS:-.problems}) // empty
+      | if type == \"array\" then map(tostring) | join(\"; \") else tostring end" 2>/dev/null) || said=""
+    said=$(_dl_trim "${said:0:400}")
+    printf '%s' "${why:-health program failed}${said:+ (the app says: $said)}"
     return 1
   fi
   declare -F dl_health_extra >/dev/null || return 0

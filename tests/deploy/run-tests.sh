@@ -722,6 +722,18 @@ assert_contains "$CALLS" "up -d --no-build --force-recreate go2rtc web wyze"
 assert_eq "$(cat "$STUB_STATE/tags/hub-web_latest")" "sha256:OLDID" "(web really back on its old image)"
 teardown
 
+setup "a failed check carries the app's own problems"
+echo 'ok {"ok":false,"problems":["laundry: needs_auth (HA_TOKEN is empty)","weather: stale"]}' >"$STUB_STATE/health"
+run_deploy DL_HEALTH_TIMEOUT=0 DL_TAG_PUSH=0
+assert_contains "$OUT" "DL_HEALTH_JQ predicate is not true (the app says: laundry: needs_auth (HA_TOKEN is empty); weather: stale)"
+teardown
+
+setup "a body with no problems list adds nothing"
+echo 'ok {"ok":false}' >"$STUB_STATE/health"
+run_deploy DL_HEALTH_TIMEOUT=0 DL_TAG_PUSH=0
+assert_not_contains "$OUT" "the app says"
+teardown
+
 # ------------------------------------------------ dl_health_extra (2.1.0)
 
 setup "dl_health_extra runs after the JSON passes, with the body and the commit"
