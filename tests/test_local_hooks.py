@@ -58,6 +58,10 @@ class ParseDiffTests(unittest.TestCase):
     def test_empty(self):
         self.assertEqual(parse_diff(""), [])
 
+    def test_space_in_path_drops_gits_trailing_tab(self):
+        diff = "diff --git a/my notes.md b/my notes.md\n+++ b/my notes.md\t\n@@ -0,0 +1 @@\n+x"
+        self.assertEqual([f.path for f in parse_diff(diff)], ["my notes.md"])
+
 
 class ScanTests(unittest.TestCase):
     def kinds(self, files, emdash=NONE, secret=NONE, names=()):
@@ -76,6 +80,14 @@ class ScanTests(unittest.TestCase):
 
     def test_binary_skipped(self):
         self.assertEqual(self.kinds([staged("a.png", binary=True)]), [])
+
+    def test_text_marked_binary_gets_the_secret_scan(self):
+        secret = "gh" + "p_" + "C" * 36
+        found = scan([staged("conf.yml", binary=True)], NONE, NONE,
+                     blob_text=lambda path: f"a: 1\ntoken: {secret}\n")
+        self.assertEqual([(f.kind, f.line) for f in found], [("GitHub token", 2)])
+        found = scan([staged("img.png", binary=True)], NONE, NONE, blob_text=lambda path: None)
+        self.assertEqual(found, [])
 
     def test_secret_patterns(self):
         samples = {
@@ -136,6 +148,15 @@ class ProtectedTests(unittest.TestCase):
         self.assertIsNone(protected("refs/heads/main-fix"))
         self.assertIsNone(protected("refs/tags/main"))
         self.assertIsNone(protected("refs/heads/feature/main"))
+
+
+class LoadRulesTests(unittest.TestCase):
+    def test_missing_allowlist_raises(self):
+        with self.assertRaises(OSError):
+            local_hooks.load_rules("drench44/x", "/nonexistent/allowlist.json")
+
+    def test_shipped_allowlist_loads(self):
+        self.assertTrue(local_hooks.load_rules("drench44/family-hub"))
 
 
 class CliTests(unittest.TestCase):

@@ -81,6 +81,12 @@ class PlanPushTests(unittest.TestCase):
         plan = plan_push(event(), api, "drench44/demo")
         self.assertTrue(any("1 of 5" in a for a in plan.alerts))
 
+    def test_diverged_without_forced_flag_is_still_a_force_push(self):
+        api = FakeGitHub({f"GET {R}/compare/{A}...{C}": {
+            "status": "diverged", "total_commits": 1, "commits": [api_commit(C, "rewritten")]}})
+        plan = plan_push(event(), api, "drench44/demo")
+        self.assertTrue(any("Force push" in a for a in plan.alerts))
+
     def test_force_push_diverged_is_alert_and_checks_new_commits(self):
         api = FakeGitHub({f"GET {R}/compare/{A}...{C}": {
             "status": "diverged", "total_commits": 1, "commits": [api_commit(C, "rewritten")]}})
@@ -245,7 +251,17 @@ class VerdictTests(unittest.TestCase):
         runs = [{"name": n, "status": "completed", "conclusion": c, "check_suite": {"id": 1}}
                 for n, c in [("a", "success"), ("b", "skipped"), ("c", "neutral")]]
         routes = {f"GET {R}/commits/{B}/pulls": [merged_pr()], **green_checks(runs=runs)}
-        self.assertTrue(self.watcher(routes).verdict(commit()).ok)
+        v = self.watcher(routes).verdict(commit())
+        self.assertTrue(v.ok)
+        self.assertIn("1 passing check", v.reason)
+
+    def test_only_skipped_checks_prove_nothing(self):
+        runs = [{"name": n, "status": "completed", "conclusion": c, "check_suite": {"id": 1}}
+                for n, c in [("b", "skipped"), ("c", "neutral")]]
+        routes = {f"GET {R}/commits/{B}/pulls": [merged_pr()], **green_checks(runs=runs)}
+        v = self.watcher(routes).verdict(commit())
+        self.assertFalse(v.ok)
+        self.assertIn("no checks", v.reason)
 
     def test_no_checks_flagged_unless_not_required(self):
         routes = {f"GET {R}/commits/{B}/pulls": [merged_pr()], **green_checks(runs=[])}
@@ -418,11 +434,32 @@ class MainTests(unittest.TestCase):
         code, summary, _, _ = self.run_main(routes, ev, {"branch": "master"})
         self.assertEqual(code, 0, summary)
 
-    def test_api_failure_fails_loudly(self):
-        routes = {f"GET {R}/compare/{A}...{C}": gh.GitHubError("down", 500)}
-        code, summary, _, _ = self.run_main(routes, event())
+    def test_api_failure_fails_loudly_and_opens_an_issue(self):
+        routes = {f"GET {R}/compare/{A}...{C}": gh.GitHubError("down", 500),
+                  f"GET {R}/issues": [], f"POST {R}/labels": {},
+                  f"POST {R}/issues": {"number": 12}}
+        code, summary, _, fake = self.run_main(routes, event())
         self.assertEqual(code, 1)
         self.assertIn("could not run", summary)
+        issue = [b for p, b in fake.posts if p == f"{R}/issues"]
+        self.assertEqual(len(issue), 1)
+        self.assertIn("could not check a push", issue[0]["body"])
+
+    def test_unexpected_error_is_loud_too(self):
+        routes = {f"GET {R}/compare/{A}...{C}": {"status": "ahead", "total_commits": 1,
+                                                  "commits": [api_commit(C, "x")]},
+                  f"GET {R}/commits/{C}/pulls": lambda _: 1 / 0,
+                  f"GET {R}/issues": [], f"POST {R}/labels": {},
+                  f"POST {R}/issues": {"number": 3}}
+        code, summary, _, _ = self.run_main(routes, event())
+        self.assertEqual(code, 1)
+        self.assertIn("ZeroDivisionError", summary)
+
+    def test_push_to_other_protected_branch_warns(self):
+        with mock.patch.object(gh, "annotate") as annotate:
+            code, _, _, _ = self.run_main({}, event(ref="refs/heads/master"))
+        self.assertEqual(code, 0)
+        self.assertEqual(annotate.call_args[0][0], "warning")
 
     def test_bad_allow_rules_fail_loudly(self):
         code, summary, _, _ = self.run_main({}, event(), {"allow-rules": "nope"})

@@ -93,6 +93,9 @@ class GitHub:
                 raise GitHubError(f"GET {path}: expected a list, got {type(page).__name__}")
             items.extend(page)
             url = _next_link(headers.get("Link") or headers.get("link") or "")
+        if url:
+            annotate("warning", f"GET {path}: stopped after {len(items)} items; the rest were "
+                     "not read.", "ci-policy")
         return items
 
 

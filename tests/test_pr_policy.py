@@ -83,7 +83,8 @@ class BandWordingTests(unittest.TestCase):
         for text in ["", "Adds a thing.\n\n## Test plan\n- ran it",
                      "Holidays price with the weekend bands everywhere. Default none.",
                      "Band names and 5-9pm were hardcoded; now derived from tou.bands.",
-                     "The price-band label went stale."]:
+                     "The price-band label went stale.",
+                     "Fixes the band layout so no agents overlap.\nOne agent panel moved."]:
             with self.subTest(text=text):
                 self.assertEqual(find_band(text), (None, ""))
 
@@ -107,6 +108,11 @@ class BandWordingTests(unittest.TestCase):
 
 
 class RegressionWordingTests(unittest.TestCase):
+    def test_claim_inside_template_comment_is_ignored(self):
+        r = evaluate(pr(body=BAND1 + "<!-- If this fixes a regression, add a test. -->"),
+                     Config())
+        self.assertEqual(check(r, "regression-test").outcome, "skip")
+
     def test_claims(self):
         for title, body in [("Fix regression in leak chart", ""),
                             ("Leak chart regressed", ""),
@@ -232,7 +238,7 @@ class SizeTests(unittest.TestCase):
         self.assertIn("100 changed lines", check(r, "size").summary)
         self.assertIn("not counted", check(r, "size").summary)
 
-    def test_rename_out_of_ignored_path_counts(self):
+    def test_rename_out_of_vendor_is_not_counted(self):
         r = evaluate(pr(files=[FileChange("src/big.ts", 3000, 0, "renamed",
                                           previous_path="vendor/big.ts")]), Config())
         # Either path being ignored is enough to skip it: moving vendored code is not authored.
@@ -371,10 +377,22 @@ class MainTests(unittest.TestCase):
                                    inputs={"owners": "drench44, somecontrib"})
         self.assertEqual(code, 1)
 
-    def test_truncated_file_list_warns(self):
+    def test_truncated_file_list_fails_size_unless_overridden(self):
         with mock.patch.object(gh, "annotate") as annotate:
-            self.run_main(gh_routes(changed_files=5000))
+            code, summary, _ = self.run_main(gh_routes(changed_files=5000))
         self.assertTrue(any("5000" in str(c) for c in annotate.call_args_list))
+        self.assertEqual(code, 1)
+        self.assertIn("only part of the changed files", summary)
+        code, _, _ = self.run_main(gh_routes(changed_files=5000, labels=["size-override"]))
+        self.assertEqual(code, 0)
+
+    def test_gitattributes_read_from_the_base_commit(self):
+        fake = FakeGitHub(gh_routes(gitattributes=""))
+        with ActionsEnv({"pull_request": {"number": 7}}) as env, \
+                mock.patch.object(gh, "GitHub", return_value=fake), mock.patch("builtins.print"):
+            pr_policy.main()
+        call = [c for c in fake.calls if c[1].endswith("/contents/.gitattributes")][0]
+        self.assertEqual(call[2], {"ref": "b" * 40})
 
 
 if __name__ == "__main__":

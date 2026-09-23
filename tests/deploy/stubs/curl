@@ -1,12 +1,17 @@
 #!/usr/bin/env bash
-# Fake curl: each call consumes the next line of $STUB_STATE/health
-# ("ok <body>" or "fail"); the last line repeats forever.
+# Fake curl. The deploy's pre-restart probe (DL_PROBE=pre) reads
+# $STUB_STATE/health_pre if present, else fails. Every other call consumes the
+# next line of $STUB_STATE/health ("ok <body>" or "fail"); the last line repeats.
 S="$STUB_STATE"
 printf 'curl %s\n' "$*" >>"$S/calls"
-n=$(( $(cat "$S/curl_count" 2>/dev/null || echo 0) + 1 )); echo "$n" >"$S/curl_count"
-total=$(wc -l <"$S/health" | tr -d ' ')
-(( n > total )) && n=$total
-line=$(sed -n "${n}p" "$S/health")
+if [[ "${DL_PROBE:-}" == pre ]]; then
+  line=$(cat "$S/health_pre" 2>/dev/null || echo fail)
+else
+  n=$(( $(cat "$S/curl_count" 2>/dev/null || echo 0) + 1 )); echo "$n" >"$S/curl_count"
+  total=$(wc -l <"$S/health" | tr -d ' ')
+  (( n > total )) && n=$total
+  line=$(sed -n "${n}p" "$S/health")
+fi
 case "$line" in
   ok\ *) printf '%s' "${line#ok }"; exit 0 ;;
   *) echo "curl: (7) Failed to connect" >&2; exit 7 ;;

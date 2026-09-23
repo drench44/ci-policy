@@ -230,13 +230,15 @@ class Watcher:
                 bad.append(f"{name} is {r.get('status')}")
             elif r.get("conclusion") not in OK_CONCLUSIONS:
                 bad.append(f"{name} {r.get('conclusion')}")
-            else:
+            elif r.get("conclusion") == "success":
+                # Skipped and neutral are not failures, but they prove nothing:
+                # a PR whose only job was skipped did not pass anything.
                 good += 1
         try:
             combined = self.api.get(f"/repos/{self.repo}/commits/{sha}/status")
         except gh.GitHubError as e:
             if e.status in (403, 404):
-                return False, ("could not read commit statuses; give the workflow "
+                return False, (f"could not read commit statuses ({e}); the workflow may need "
                                "`statuses: read` permission")
             raise
         for s in combined.get("statuses") or []:
@@ -335,17 +337,24 @@ def load_config() -> Config:
 
 
 def main() -> int:
+    api = None
+    cfg = None
+    event = None
+    repo = os.environ.get("GITHUB_REPOSITORY", "")
+    branch = ""
     try:
         cfg = load_config()
         event = gh.load_event()
-        repo = os.environ.get("GITHUB_REPOSITORY", "")
         branch = gh.env_input("branch") or (event.get("repository") or {}).get("default_branch")
         if not branch:
             raise ValueError("could not tell the default branch; set the `branch` input")
         ref = event.get("ref") or os.environ.get("GITHUB_REF", "")
         if ref != f"refs/heads/{branch}":
-            gh.annotate("notice", f"main-watch only watches {branch}; this push was to {ref}.",
-                        "main-watch")
+            protected_elsewhere = ref in ("refs/heads/main", "refs/heads/master")
+            gh.annotate("warning" if protected_elsewhere else "notice",
+                        f"main-watch only watches {branch}; this push was to {ref}."
+                        + (" Check the workflow's `branch` input." if protected_elsewhere
+                           else ""), "main-watch")
             gh.write_summary(f"## main-watch skipped\n\nThis push was to `{ref}`, "
                              f"not `{branch}`.\n")
             return 0
@@ -354,9 +363,24 @@ def main() -> int:
         plan = plan_push(event, api, repo)
         watcher = Watcher(api, repo, branch, cfg)
         verdicts = [watcher.verdict(c) for c in plan.commits]
-    except (gh.GitHubError, ValueError, KeyError) as e:
-        gh.annotate("error", f"main-watch could not check this push: {e}", "main-watch")
-        gh.write_summary(f"## main-watch could not run\n\n{gh.md_escape(str(e))}\n")
+    except Exception as e:  # noqa: BLE001  any failure must be loud, never a quiet pass
+        detail = f"{type(e).__name__}: {e}"
+        gh.annotate("error", f"main-watch could not check this push: {detail}", "main-watch")
+        gh.write_summary(f"## main-watch could not run\n\n{gh.md_escape(detail)}\n")
+        # A push nobody checked is as bad as a flagged one: open the issue too,
+        # when there is enough to do it with.
+        try:
+            if api is not None and repo:
+                raise_alert(api, repo, (cfg.label if cfg else "main-watch"),
+                            branch or "the default branch",
+                            f"**main-watch could not check a push** to `{branch}` "
+                            f"(`{(event or {}).get('before', '?')[:7]}..."
+                            f"{(event or {}).get('after', '?')[:7]}`), so it is unverified.\n\n"
+                            f"Error: `{gh.md_escape(detail)[:500]}`\n\nRe-run the workflow "
+                            "once the cause is fixed. Nothing was reverted.")
+        except Exception as alert_error:  # noqa: BLE001
+            gh.annotate("error", f"main-watch also could not open the alert issue: "
+                        f"{alert_error}", "main-watch")
         return 1
 
     flagged = [v for v in verdicts if not v.ok]

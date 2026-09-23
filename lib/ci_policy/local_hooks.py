@@ -141,7 +141,8 @@ def parse_diff(diff: str) -> List[StagedFile]:
             continue
         if not in_hunk:
             if line.startswith("+++ "):
-                target = line[4:]
+                # git appends a TAB to header paths that contain a space.
+                target = line[4:].rstrip("\t")
                 if target != "/dev/null":
                     target = _unquote(target)
                     if target.startswith("b/"):
@@ -152,7 +153,7 @@ def parse_diff(diff: str) -> List[StagedFile]:
             if line.startswith("Binary files ") and line.endswith(" differ"):
                 m = re.match(r"Binary files .* and (.*) differ$", line)
                 if m and m.group(1) != "/dev/null":
-                    target = _unquote(m.group(1))
+                    target = _unquote(m.group(1).rstrip("\t"))
                     target = target[2:] if target.startswith("b/") else target
                     files.append(StagedFile(target, True, []))
                 continue
@@ -171,26 +172,49 @@ def parse_diff(diff: str) -> List[StagedFile]:
 
 
 def staged_names(cwd: Optional[str] = None) -> List[str]:
-    """Every added, copied, modified or renamed path (renames with no content change too)."""
-    out = git("diff", "--cached", "--name-only", "-z", "--diff-filter=ACMR", "--find-renames",
+    """Every staged path except deletions (renames and type changes too)."""
+    out = git("diff", "--cached", "--name-only", "-z", "--diff-filter=ACMRT", "--find-renames",
               cwd=cwd)
     return [p for p in out.split("\0") if p]
 
 
 def staged_files(cwd: Optional[str] = None) -> List[StagedFile]:
     diff = git("diff", "--cached", "--no-color", "--no-ext-diff", "--no-textconv", "-U0",
-               "--src-prefix=a/", "--dst-prefix=b/", "--diff-filter=ACMR", "--find-renames",
+               "--src-prefix=a/", "--dst-prefix=b/", "--diff-filter=ACMRT", "--find-renames",
                cwd=cwd)
     return parse_diff(diff)
 
 
+BLOB_SCAN_LIMIT = 5 * 1024 * 1024
+
+
+def staged_blob_text(path: str, cwd: Optional[str] = None) -> Optional[str]:
+    """The staged content of a file git called binary, as text, if it really is text.
+
+    A `.gitattributes` entry such as `-diff` or `binary` makes git report a text
+    file as binary, which would hide it from the line scan. Real binaries (a NUL
+    byte early on) and very large blobs return None.
+    """
+    proc = subprocess.run(["git", "cat-file", "-p", f":{path}"], cwd=cwd, capture_output=True)
+    if proc.returncode != 0:
+        raise RuntimeError(f"could not read the staged {path}: "
+                           f"{proc.stderr.decode(errors='replace').strip()}")
+    data = proc.stdout
+    if len(data) > BLOB_SCAN_LIMIT or b"\0" in data[:8000]:
+        return None
+    return data.decode("utf-8", errors="replace")
+
+
 def read_gitattributes(cwd: Optional[str] = None) -> str:
-    """The .gitattributes this commit will have (the index copy), or ""."""
-    staged = subprocess.run(["git", "show", ":.gitattributes"], cwd=cwd, capture_output=True,
-                            text=True, encoding="utf-8", errors="replace")
-    if staged.returncode == 0:
-        return staged.stdout
-    return ""
+    """The committed (HEAD) .gitattributes, or "".
+
+    Not the staged copy: a commit must not be able to exempt itself by adding
+    `* linguist-generated` in the same commit. A change takes effect from the
+    next commit, the same way pr-policy reads it from the PR's base.
+    """
+    head = subprocess.run(["git", "show", "HEAD:.gitattributes"], cwd=cwd, capture_output=True,
+                          text=True, encoding="utf-8", errors="replace")
+    return head.stdout if head.returncode == 0 else ""
 
 
 # ------------------------------------------------------------------- checks
@@ -199,29 +223,44 @@ def _redact(text: str) -> str:
     return text[:6] + "..." if len(text) > 6 else "..."
 
 
+def _scan_secrets(path: str, lines: Iterable[Tuple[int, str]]) -> List[Finding]:
+    found: List[Finding] = []
+    for number, text in lines:
+        if ALLOW_MARKER in text:
+            continue
+        for kind, pattern in SECRET_PATTERNS:
+            m = pattern.search(text)
+            if m:
+                found.append(Finding(kind, path, number, _redact(m.group(0))))
+                break
+    return found
+
+
 def scan(files: Sequence[StagedFile], emdash_allow: GlobSet, secret_allow: GlobSet,
-         names: Sequence[str] = ()) -> List[Finding]:
+         names: Sequence[str] = (), blob_text=None) -> List[Finding]:
+    """``blob_text(path)`` returns the full text of a file git called binary, or None."""
     findings: List[Finding] = []
     for path in dict.fromkeys(list(names) + [f.path for f in files]):
         if _SECRET_FILE.search(path) and not secret_allow.matches(path):
             findings.append(Finding("secret file", path, 0,
                                     "files with this name hold secrets; keep it out of git"))
     for f in files:
-        if f.binary:
-            continue
-        check_dash = not emdash_allow.matches(f.path)
         check_secret = not secret_allow.matches(f.path)
-        for number, text in f.added:
-            if check_dash and EM_DASH in text:
-                col = text.index(EM_DASH)
-                snippet = text[max(0, col - 30):col + 30].strip()
-                findings.append(Finding("em dash", f.path, number, snippet))
-            if check_secret and ALLOW_MARKER not in text:
-                for kind, pattern in SECRET_PATTERNS:
-                    m = pattern.search(text)
-                    if m:
-                        findings.append(Finding(kind, f.path, number, _redact(m.group(0))))
-                        break
+        if f.binary:
+            # Only the secret scan, over the whole file: which lines are new
+            # is unknown, and a real binary has no lines at all.
+            text = blob_text(f.path) if (blob_text and check_secret) else None
+            if text is not None:
+                findings.extend(_scan_secrets(f.path, enumerate(text.splitlines(), 1)))
+            continue
+        if not emdash_allow.matches(f.path):
+            for number, text in f.added:
+                if EM_DASH in text:
+                    col = text.index(EM_DASH)
+                    snippet = text[max(0, col - 30):col + 30].strip()
+                    findings.append(Finding("em dash", f.path, number, snippet))
+        if check_secret:
+            findings.extend(_scan_secrets(f.path, f.added))
     return findings
 
 
@@ -233,7 +272,8 @@ def pre_commit(cwd: Optional[str] = None) -> int:
     emdash_allow = GlobSet(config_all("ci-policy.emdashAllow", cwd)
                            + gitattributes_globs(read_gitattributes(cwd)))
     secret_allow = GlobSet(config_all("ci-policy.secretAllow", cwd))
-    findings = scan(files, emdash_allow, secret_allow, names)
+    findings = scan(files, emdash_allow, secret_allow, names,
+                    blob_text=lambda path: staged_blob_text(path, cwd))
     if not findings:
         return 0
     dashes = [f for f in findings if f.kind == "em dash"]
@@ -269,9 +309,12 @@ def protected(ref: str) -> Optional[str]:
 
 
 def repo_name(remote: str, url: str, cwd: Optional[str] = None) -> Optional[str]:
-    override = git("config", "--get", "ci-policy.repo", cwd=cwd, check=False).strip()
-    if override:
-        return override
+    """owner/name for the allowlist.
+
+    A GitHub URL always wins, so `git config ci-policy.repo <other repo>` cannot
+    borrow another repo's allowlist for a real GitHub remote. The override is
+    only for remotes that are not GitHub URLs (tests, mirrors).
+    """
     # The configured URL first: git hands hooks the URL after insteadOf
     # rewriting, which may no longer look like GitHub.
     if remote:
@@ -280,7 +323,11 @@ def repo_name(remote: str, url: str, cwd: Optional[str] = None) -> Optional[str]
             found = allowlist.repo_from_url(configured)
             if found:
                 return found
-    return allowlist.repo_from_url(url)
+    found = allowlist.repo_from_url(url)
+    if found:
+        return found
+    override = git("config", "--get", "ci-policy.repo", cwd=cwd, check=False).strip()
+    return override or None
 
 
 def _commit_files(sha: str, cwd: Optional[str]) -> List[str]:
@@ -294,8 +341,11 @@ def check_commits(commits: Iterable[str], rules: Sequence[allowlist.Rule], branc
     allowed: List[str] = []
     refused: List[str] = []
     for sha in commits:
-        subject = git("log", "-1", "--format=%s", sha, cwd=cwd).strip()
-        rule = allowlist.match(rules, subject, branch, lambda s=sha: _commit_files(s, cwd))
+        subject, _, who = git("log", "-1", "--format=%s%x00%an%x00%ae", sha,
+                              cwd=cwd).rstrip("\n").partition("\0")
+        authors = who.split("\0")
+        rule = allowlist.match(rules, subject, branch, lambda s=sha: _commit_files(s, cwd),
+                               authors)
         line = f"{sha[:9]} {subject}"
         if rule:
             allowed.append(f"{line}  (allowed: {rule.name})")
@@ -314,13 +364,43 @@ def _have_object(sha: str, cwd: Optional[str]) -> bool:
                           capture_output=True).returncode == 0
 
 
+def remote_heads(remote: str, cwd: Optional[str]) -> List[str]:
+    """Commit shas of every branch on the remote. Raises RuntimeError if unreachable."""
+    try:
+        proc = subprocess.run(["git", "ls-remote", "--heads", remote], cwd=cwd,
+                              capture_output=True, text=True, timeout=30)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"git ls-remote {remote} timed out") from None
+    if proc.returncode != 0:
+        raise RuntimeError(f"git ls-remote {remote} failed: {proc.stderr.strip()}")
+    return [line.split()[0] for line in proc.stdout.splitlines() if line.strip()]
+
+
 def judge_update(local_sha: str, remote_sha: str, branch: str, rules: Sequence[allowlist.Rule],
-                 cwd: Optional[str] = None) -> Tuple[bool, List[str]]:
+                 cwd: Optional[str] = None, remote: str = "") -> Tuple[bool, List[str]]:
     """Decide one update of a protected branch. Returns (ok, message lines)."""
     if local_sha == ZERO:
         return False, [f"deleting {branch} on the remote"]
     if remote_sha == ZERO:
-        return True, [f"creating {branch} on a remote that does not have it yet (new repo)"]
+        # Creating the branch. Fine on an empty remote (a brand-new repo). On a
+        # remote that has other branches, everything it does not have yet must
+        # pass the allowlist, the same as an update.
+        heads = remote_heads(remote, cwd) if remote else []
+        if not heads:
+            return True, [f"creating {branch} on a remote with no branches yet (new repo)"]
+        missing = [h for h in heads if not _have_object(h, cwd)]
+        if missing:
+            return False, [f"creating {branch}: the remote has branches this clone has not "
+                           f"fetched ({missing[0][:9]}); fetch first"]
+        commits = git("rev-list", "--reverse", local_sha, "--not", *heads, cwd=cwd).split()
+        if not commits:
+            return True, [f"creating {branch} at a commit the remote already has"]
+        allowed, refused = check_commits(commits, rules, branch, cwd)
+        if refused:
+            return False, ([f"creating {branch} would land {len(refused)} commit(s) without "
+                            "a PR:"] + [f"    {r}" for r in refused[:15]])
+        return True, ["every commit is on the main-branch allowlist:"] + [
+            f"    {a}" for a in allowed]
     if not _have_object(remote_sha, cwd):
         return False, [f"the remote {branch} is at {remote_sha[:9]}, which this clone does "
                        "not have; fetch first. A push that replaces unknown history is a "
@@ -340,9 +420,14 @@ def judge_update(local_sha: str, remote_sha: str, branch: str, rules: Sequence[a
 
 
 def load_rules(repo: Optional[str], path: Optional[str] = None) -> List[allowlist.Rule]:
-    path = path or os.environ.get("CI_POLICY_ALLOWLIST") or DEFAULT_ALLOWLIST
+    """Allow rules for this repo. A missing or broken allowlist raises (fail closed)."""
+    override = os.environ.get("CI_POLICY_ALLOWLIST")
+    if override and not path:
+        print(f"ci-policy: using the allowlist from CI_POLICY_ALLOWLIST={override}",
+              file=sys.stderr)
+    path = path or override or DEFAULT_ALLOWLIST
     if not os.path.exists(path):
-        return []
+        raise OSError(f"the allowlist {path} is missing; reinstall ci-policy")
     return allowlist.rules_for(allowlist.load(path), repo)
 
 
@@ -367,7 +452,8 @@ def pre_push(remote: str, url: str, lines: Iterable[str], cwd: Optional[str] = N
         return 1
     status = 0
     for local_ref, local_sha, remote_ref, remote_sha, branch in updates:
-        ok, lines_out = judge_update(local_sha, remote_sha, branch, rules, cwd)
+        ok, lines_out = judge_update(local_sha, remote_sha, branch, rules, cwd,
+                                     remote or url)
         if ok:
             print(f"ci-policy pre-push: allowed push to {branch}: " + "\n".join(lines_out),
                   file=sys.stderr)
@@ -413,11 +499,12 @@ def allow_check(remote: str, branch: str, src: str, cwd: Optional[str] = None) -
             return 2
         remote_sha = ZERO
     try:
-        rules = load_rules(repo_name(remote, "", cwd))
+        url = remote if ("/" in remote or ":" in remote) else ""
+        rules = load_rules(repo_name(remote, url, cwd))
     except (OSError, ValueError) as e:
         print(f"cannot read the allowlist: {e}", file=sys.stderr)
         return 2
-    ok, lines_out = judge_update(local_sha, remote_sha, branch, rules, cwd)
+    ok, lines_out = judge_update(local_sha, remote_sha, branch, rules, cwd, remote)
     print("\n".join(lines_out), file=sys.stderr)
     return 0 if ok else 1
 

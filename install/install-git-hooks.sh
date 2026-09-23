@@ -32,10 +32,15 @@
 #   --dry-run         print what would change, change nothing
 set -euo pipefail
 
+# Every hook git runs from a hooks directory, so each repo's own hook of that
+# name keeps running through the chain. Server-side names matter because a
+# global core.hooksPath applies to bare repos too. Left out on purpose:
+# push-to-checkout and proc-receive, whose mere presence changes what git does
+# (push-to-checkout replaces updateInstead's own working tree update).
 HOOK_NAMES=(applypatch-msg pre-applypatch post-applypatch pre-commit pre-merge-commit
   prepare-commit-msg commit-msg post-commit pre-rebase post-checkout post-merge pre-push
-  post-rewrite reference-transaction pre-auto-gc push-to-checkout sendemail-validate
-  post-index-change)
+  post-rewrite reference-transaction pre-auto-gc sendemail-validate post-index-change
+  pre-receive update post-receive post-update)
 MARK="ci-policy managed"
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
@@ -91,7 +96,7 @@ find_repos() {
   local root
   for root in ${SCANS[@]+"${SCANS[@]}"}; do
     [[ -d "$root" ]] || continue
-    find "$root" -maxdepth 3 -type d \( -name node_modules -o -name .venv \) -prune \
+    find "$root" -maxdepth 4 -type d \( -name node_modules -o -name .venv \) -prune \
       -o -type d -name .git -print 2>/dev/null | sed 's|/\.git$||'
   done | sort -u
 }
@@ -238,7 +243,7 @@ do_uninstall() {
 }
 
 do_check() {
-  local problems=0 current includes repo local_path chain name
+  local problems=0 current includes repo chain name
   if [[ -f "$PREFIX/installed.txt" ]]; then
     say "code: $PREFIX ($(sed -n 's/^commit=//p' "$PREFIX/installed.txt"))"
   else
@@ -258,12 +263,15 @@ do_check() {
   else
     say "PROBLEM: git is not pointed at $HOOKS_DIR"; problems=1
   fi
+  local scoped
   while IFS= read -r repo; do
     [[ -n "$repo" ]] || continue
-    local_path=$(git -C "$repo" config --local --get core.hooksPath 2>/dev/null || true)
+    # Any scope nearer than global (local, worktree) shadows the policy.
+    scoped=$(git -C "$repo" config --show-scope --get-all core.hooksPath 2>/dev/null \
+      | awk -v ours="$HOOKS_DIR" '($1 == "local" || $1 == "worktree") && $2 != ours' || true)
     chain=$(git -C "$repo" config --local --get ci-policy.chainHooksPath 2>/dev/null || true)
-    if [[ -n "$local_path" && "$local_path" != "$HOOKS_DIR" ]]; then
-      say "PROBLEM: $repo sets its own core.hooksPath ($local_path), so the policy is skipped there; rerun install"
+    if [[ -n "$scoped" ]]; then
+      say "PROBLEM: $repo sets its own core.hooksPath ($(printf '%s' "$scoped" | tr '\n' ' ')), so the policy is skipped there; rerun install"
       problems=1
     elif [[ -n "$chain" ]]; then
       say "ok: $repo chains to $chain"

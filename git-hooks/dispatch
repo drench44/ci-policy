@@ -35,11 +35,22 @@ chain_target() {
         dir="$top/$dir" ;;
     esac
   else
-    dir=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || return 0
+    dir=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) \
+      || dir=$(git rev-parse --git-common-dir 2>/dev/null) \
+      || { echo "ci-policy: could not find this repo's git dir; its own $hook hook did not run" >&2; return 0; }
+    case "$dir" in /*) ;; *) dir="$PWD/$dir" ;; esac
     dir="$dir/hooks"
   fi
+  if [ ! -d "$dir" ] && [ -n "$(git config --get ci-policy.chainHooksPath 2>/dev/null)" ]; then
+    echo "ci-policy: ci-policy.chainHooksPath points at $dir, which does not exist; this repo's own $hook hook did not run" >&2
+    return 0
+  fi
   local target="$dir/$hook"
-  [ -f "$target" ] && [ -x "$target" ] || return 0
+  [ -f "$target" ] || return 0
+  if [ ! -x "$target" ]; then
+    echo "hint: The '$target' hook was ignored because it's not set as executable." >&2
+    return 0
+  fi
   # Never chain back into the global hooks directory (that would loop).
   local self_dir target_dir
   self_dir="${CI_POLICY_HOOKS_DIR:-}"
@@ -77,12 +88,16 @@ case "$hook" in
   pre-push|post-rewrite|reference-transaction)
     stdin_file=$(mktemp "${TMPDIR:-/tmp}/ci-policy-hook.XXXXXX") || exit 1
     trap 'rm -f "$stdin_file"' EXIT
-    cat >"$stdin_file"
+    cat >"$stdin_file" || {
+      echo "ci-policy $hook: could not buffer stdin; refusing (fail closed)." >&2
+      exit 1
+    }
     ;;
 esac
 
 if [ "$has_policy" = 1 ]; then
-  if ! command -v python3 >/dev/null 2>&1; then
+  PY="${CI_POLICY_PYTHON:-python3}"
+  if ! command -v "$PY" >/dev/null 2>&1; then
     echo "ci-policy $hook: python3 not found, so the policy cannot run; refusing (fail closed)." >&2
     exit 1
   fi
@@ -92,10 +107,10 @@ if [ "$has_policy" = 1 ]; then
   fi
   if [ -n "$stdin_file" ]; then
     PYTHONPATH="$CI_POLICY_HOME/lib" PYTHONDONTWRITEBYTECODE=1 \
-      python3 -m ci_policy.local_hooks "$hook" "$@" <"$stdin_file" || exit 1
+      "$PY" -m ci_policy.local_hooks "$hook" "$@" <"$stdin_file" || exit 1
   else
     PYTHONPATH="$CI_POLICY_HOME/lib" PYTHONDONTWRITEBYTECODE=1 \
-      python3 -m ci_policy.local_hooks "$hook" </dev/null || exit 1
+      "$PY" -m ci_policy.local_hooks "$hook" </dev/null || exit 1
   fi
 fi
 

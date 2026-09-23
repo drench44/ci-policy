@@ -121,6 +121,7 @@ mkdir -p "$R/vendor"
 commit vendor/up.html "a ${EMDASH} b"
 assert_eq "$RC" 0 "$OUT"
 printf 'board.html linguist-vendored\n' >"$R/.gitattributes"; git -C "$R" add .gitattributes
+git -C "$R" commit -q -m attrs
 commit board.html "a ${EMDASH} b"
 assert_eq "$RC" 0 "$OUT"
 teardown
@@ -361,6 +362,145 @@ rm -rf "$HOME/.config/ci-policy/lib"
 commit b.txt "fine"
 assert_eq "$RC" 1
 assert_contains "$OUT" "fail closed"
+teardown
+
+setup "a real force push of an allowlisted commit is still refused"
+install
+git -C "$R" config ci-policy.repo drench44/family-hub
+echo 1.4.1 >"$R/VERSION"; git -C "$R" add -A; git -C "$R" commit -q --no-verify -m "release: v1.4.1"
+push origin main
+assert_eq "$RC" 0 "$OUT"
+git -C "$R" reset -q --hard HEAD~1
+echo 1.4.2 >"$R/VERSION"; git -C "$R" add -A; git -C "$R" commit -q --no-verify -m "release: v1.4.2"
+push --force origin main
+assert_eq "$RC" 1
+assert_contains "$OUT" "force push"
+teardown
+
+setup "an allowlisted push onto remote history this clone lacks is refused"
+install
+git -C "$R" config ci-policy.repo drench44/family-hub
+git clone -q "$T/origin.git" "$T/other"
+echo x >"$T/other/x.txt"; git -C "$T/other" add x.txt
+git -C "$T/other" -c core.hooksPath=/dev/null commit -q -m other
+git -C "$T/other" -c core.hooksPath=/dev/null push -q origin main
+echo 1.4.1 >"$R/VERSION"; git -C "$R" add -A; git -C "$R" commit -q --no-verify -m "release: v1.4.1"
+push --force origin main
+assert_eq "$RC" 1
+assert_contains "$OUT" "fetch first"
+teardown
+
+setup "creating master on a remote that already has main needs the allowlist"
+install
+commit b.txt "fine"
+push origin HEAD:master
+assert_eq "$RC" 1
+assert_contains "$OUT" "creating master would land"
+git -C "$R" reset -q --hard HEAD~1
+push origin HEAD:master
+assert_eq "$RC" 0 "(a commit the remote already has) $OUT"
+teardown
+
+setup "the allowlist is per branch: a main release rule does not open master"
+install
+git -C "$R" config ci-policy.repo drench44/family-hub
+git -C "$R" push -q origin main:master 2>/dev/null || CI_POLICY_ALLOW_MAIN_PUSH=1 git -C "$R" push -q origin main:master 2>/dev/null
+echo 1.4.1 >"$R/VERSION"; git -C "$R" add -A; git -C "$R" commit -q --no-verify -m "release: v1.4.1"
+push origin HEAD:master
+assert_eq "$RC" 1 "$OUT"
+teardown
+
+setup "ci-policy.repo cannot borrow another repo's allowlist for a GitHub remote"
+install
+git -C "$R" config ci-policy.repo drench44/claude-config-backup
+git -C "$R" config url."$T/origin.git".insteadOf "https://github.com/drench44/demo.git"
+git -C "$R" remote set-url origin "https://github.com/drench44/demo.git"
+CI_POLICY_ALLOW_MAIN_PUSH=1 git -C "$R" push -q origin main:master 2>/dev/null
+echo m >"$R/m.md"; git -C "$R" add m.md; git -C "$R" commit -q --no-verify -m "memory: note"
+push origin HEAD:master
+assert_eq "$RC" 1 "$OUT"
+teardown
+
+setup "a broken or missing allowlist refuses pushes to main"
+install
+git -C "$R" config ci-policy.repo drench44/family-hub
+echo 1.4.1 >"$R/VERSION"; git -C "$R" add -A; git -C "$R" commit -q --no-verify -m "release: v1.4.1"
+echo '{not json' >"$T/bad.json"
+OUT=$(CI_POLICY_ALLOWLIST="$T/bad.json" git -C "$R" push origin main 2>&1); assert_eq "$?" 1
+assert_contains "$OUT" "cannot read the allowlist"
+OUT=$(CI_POLICY_ALLOWLIST="$T/missing.json" git -C "$R" push origin main 2>&1); assert_eq "$?" 1
+assert_contains "$OUT" "missing"
+teardown
+
+setup "a failing repo pre-push hook blocks the push"
+printf '#!/bin/sh\necho repo-pre-push-says-no >&2\nexit 1\n' >"$R/.git/hooks/pre-push"
+chmod +x "$R/.git/hooks/pre-push"
+install
+commit b.txt "fine"
+push origin HEAD:refs/heads/feature
+assert_eq "$RC" 1
+assert_contains "$OUT" "repo-pre-push-says-no"
+teardown
+
+setup "a chain that loops back through the dispatcher stops at the depth guard"
+install
+mkdir -p "$T/loop"
+printf '#!/bin/sh\nexec "%s" pre-commit "$@"\n' "$HOME/.config/ci-policy/git-hooks/dispatch" >"$T/loop/pre-commit"
+chmod +x "$T/loop/pre-commit"
+git -C "$R" config ci-policy.chainHooksPath "$T/loop"
+commit b.txt "fine"
+assert_eq "$RC" 1
+assert_contains "$OUT" "nested"
+teardown
+
+setup "no python means fail closed; a missing chain dir is reported"
+install
+OUT=$(cd "$R" && echo z >z.txt && git add z.txt && CI_POLICY_PYTHON=/nonexistent/python3 git commit -m z 2>&1); assert_eq "$?" 1
+assert_contains "$OUT" "not found"
+git -C "$R" reset -q
+git -C "$R" config ci-policy.chainHooksPath "$T/gone"
+commit b.txt "fine"
+assert_eq "$RC" 0
+assert_contains "$OUT" "does not exist"
+teardown
+
+setup "a non-executable repo hook is ignored with a note, like git does"
+printf '#!/bin/sh\nexit 1\n' >"$R/.git/hooks/commit-msg"
+install
+commit b.txt "fine"
+assert_eq "$RC" 0
+assert_contains "$OUT" "not set as executable"
+teardown
+
+setup "type change from symlink to file and a -diff attribute cannot hide a secret"
+install
+tok="gh""p_$(printf 'B%.0s' {1..36})"
+ln -s a.txt "$R/link"; git -C "$R" add link; git -C "$R" commit -q -m link --no-verify
+rm "$R/link"; printf "TOKEN='%s'\n" "$tok" >"$R/link"; git -C "$R" add link
+OUT=$(git -C "$R" commit -m typechange 2>&1); assert_eq "$?" 1 "(type change)"
+git -C "$R" reset -q --hard
+printf 'conf.yml -diff\n' >"$R/.gitattributes"; git -C "$R" add .gitattributes
+git -C "$R" commit -q -m attrs --no-verify
+printf "TOKEN='%s'\n" "$tok" >"$R/conf.yml"; git -C "$R" add conf.yml
+OUT=$(git -C "$R" commit -m conf 2>&1); assert_eq "$?" 1 "(-diff attribute)"
+assert_contains "$OUT" "GitHub token"
+teardown
+
+setup "a commit cannot exempt itself by adding linguist-generated in the same commit"
+install
+printf '* linguist-generated\n' >"$R/.gitattributes"; git -C "$R" add .gitattributes
+commit c.md "a ${EMDASH} b"
+assert_eq "$RC" 1
+teardown
+
+setup "server-side hooks of a bare repo still run through the chain"
+install
+printf '#!/bin/sh\ncat >/dev/null\ntouch "%s/post-receive-ran"\n' "$T" >"$T/origin.git/hooks/post-receive"
+chmod +x "$T/origin.git/hooks/post-receive"
+push origin HEAD:refs/heads/feature
+assert_eq "$RC" 0 "$OUT"
+[[ -f "$T/post-receive-ran" ]] && ok || fail "bare repo post-receive did not run"
+[[ ! -e "$HOME/.config/git/hooks/push-to-checkout" ]] && ok || fail "push-to-checkout wrapper must not exist"
 teardown
 
 # ---------------------------------------------------------------- scope + uninstall

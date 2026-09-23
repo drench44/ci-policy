@@ -17,8 +17,9 @@ DL_LIB_VERSION="2.0.0"
 # What one deploy does (dl_run):
 #   1. Preflight: settings complete, tools present, git tree clean, health
 #      gate not shallow.
-#   2. Rollback point: tag each service's running image <image>:pre-<sha>
-#      (<sha> = the commit being deployed), snapshot the compose directory
+#   2. Rollback point: tag each service's running image
+#      <image>:pre-<UTC time>-<sha> (<sha> = the commit being deployed; the
+#      newest DL_SNAPSHOT_KEEP such tags are kept), snapshot the compose directory
 #      to a tarball on the box, and create + push git tag
 #      rollback-point/<service>/<UTC time> on the commit that was running
 #      (read from the box's state file). Git now records what to go back to.
@@ -26,10 +27,11 @@ DL_LIB_VERSION="2.0.0"
 #   4. Required files and env values on the box. Missing: restore the
 #      snapshot and stop before anything restarts.
 #   5. docker compose up -d --build.
-#   6. Poll the health URL until every requirement holds, or time out.
+#   6. Poll the health URL until every requirement holds, or time out; after
+#      DL_HEALTH_SETTLE seconds check once more.
 #   7. Healthy: record the new commit in the box state file, create + push
 #      git tag deploy/<service>/<UTC time>-<sha>.
-#      Not healthy: restore the snapshot, retag <image>:pre-<sha> back onto
+#      Not healthy: restore the snapshot, retag the pre- image back onto
 #      the compose image name, recreate without building, check health
 #      again, and create + push git tag failed-deploy/<service>/<time>-<sha>.
 #
@@ -54,7 +56,14 @@ DL_LIB_VERSION="2.0.0"
 #   DL_HEALTH_FRESH     "<jq path> <max age seconds>" lines: a timestamp (ISO 8601
 #                       with Z or an offset, or epoch seconds/ms) that must be at
 #                       most that old, e.g. ".weather.observed_at 5400".
-#   DL_HEALTH_JQ        optional extra jq predicate that must be true.
+#   DL_HEALTH_JQ        optional extra jq predicate; every value it yields must be
+#                       true, and it must yield at least one.
+#   DL_HEALTH_COMMIT    optional jq path to the commit the app reports it runs;
+#                       it must match the deployed commit (full or short sha).
+#                       The only proof the NEW version answered; set it if the
+#                       app can report its commit.
+#   DL_HEALTH_SETTLE    seconds to wait after the first healthy answer, then
+#                       check again (catches crash loops). Default 10.
 #   DL_HEALTH_SHALLOW_OK=1  allow a gate with none of the three above (not advised).
 #   DL_HEALTH_FROM      "local" (curl here, default) or "remote" (curl on DL_REMOTE,
 #                       for services bound to the box's loopback only).
@@ -72,7 +81,7 @@ DL_LIB_VERSION="2.0.0"
 #   DL_STATE_DIR        state dir on the box. Default
 #                       $HOME/.local/state/homelab-deploy/<service> (box's $HOME).
 #   DL_GIT_DIR          repo being deployed. Default: current directory.
-#   DL_SHA              commit being deployed. Default: HEAD of DL_GIT_DIR.
+#   DL_SHA              optional; if set it must equal HEAD (the checkout is what ships).
 #   DL_GIT_REMOTE       where tags are pushed. Default origin.
 #   DL_TAG_PUSH         1 = create and push git tags (default), 0 = skip.
 #   DL_ALLOW_DIRTY      1 = allow deploying with uncommitted changes. Default 0.
@@ -209,6 +218,23 @@ dl_preflight() {
       dl_err "DL_HEALTH_FRESH line '$line' must be '<jq path> <max age seconds>'"; return 3
     fi
   done <<<"${DL_HEALTH_FRESH:-}"
+  local name val
+  for name in DL_HEALTH_TIMEOUT DL_SNAPSHOT_KEEP; do
+    val="${!name:-}"
+    if [[ -n "$val" && ! "$val" =~ ^[0-9]+$ ]]; then
+      dl_err "$name must be a whole number, not '$val'"; return 3
+    fi
+  done
+  if [[ "${DL_SNAPSHOT_KEEP:-5}" -lt 1 ]]; then
+    dl_err "DL_SNAPSHOT_KEEP must be at least 1 (the snapshot just taken is the rollback point)"
+    return 3
+  fi
+  for name in DL_HEALTH_INTERVAL DL_HEALTH_SETTLE; do
+    val="${!name:-}"
+    if [[ -n "$val" && ! "$val" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+      dl_err "$name must be a number of seconds, not '$val'"; return 3
+    fi
+  done
   local tool
   for tool in curl jq git tar; do
     command -v "$tool" >/dev/null 2>&1 || { dl_err "$tool is not installed"; return 3; }
@@ -219,16 +245,39 @@ dl_preflight() {
   if ! git -C "$gitdir" rev-parse --git-dir >/dev/null 2>&1; then
     dl_err "DL_GIT_DIR '$gitdir' is not a git repository"; return 3
   fi
-  if [[ "${DL_ALLOW_DIRTY:-0}" != 1 ]] && [[ -n "$(git -C "$gitdir" status --porcelain)" ]]; then
+  local porcelain
+  porcelain=$(git -C "$gitdir" status --porcelain) \
+    || { dl_err "git status failed in $gitdir"; return 3; }
+  if [[ "${DL_ALLOW_DIRTY:-0}" != 1 && -n "$porcelain" ]]; then
     dl_err "the working tree has uncommitted changes; commit them first (or DL_ALLOW_DIRTY=1)"
     return 3
   fi
-  DL_FULL_SHA=$(git -C "$gitdir" rev-parse --verify "${DL_SHA:-HEAD}^{commit}" 2>/dev/null) \
-    || { dl_err "cannot resolve commit '${DL_SHA:-HEAD}'"; return 3; }
+  DL_FULL_SHA=$(git -C "$gitdir" rev-parse --verify "HEAD^{commit}" 2>/dev/null) \
+    || { dl_err "cannot resolve HEAD in $gitdir"; return 3; }
+  if [[ -n "${DL_SHA:-}" ]]; then
+    # The deploy ships the checkout (dl_sync copies files), so the commit it
+    # records must be the checkout's HEAD.
+    local want
+    want=$(git -C "$gitdir" rev-parse --verify "${DL_SHA}^{commit}" 2>/dev/null) \
+      || { dl_err "cannot resolve commit '$DL_SHA'"; return 3; }
+    if [[ "$want" != "$DL_FULL_SHA" ]]; then
+      dl_err "DL_SHA $DL_SHA is not HEAD ($DL_FULL_SHA); check it out first, the deploy ships the checkout"
+      return 3
+    fi
+  fi
   DL_SHORT_SHA="${DL_FULL_SHA:0:12}"
+  # A typo in a jq path must be a config error now, not an "unhealthy" deploy
+  # that rolls back a working service later. jq exits 3 on a compile error.
+  local compile_rc=0 compile_err
+  compile_err=$(jq -n "$(_dl_health_program)" 2>&1 >/dev/null) || compile_rc=$?
+  if [[ $compile_rc == 3 ]]; then
+    dl_err "the health gate does not compile as jq (check DL_HEALTH_REQUIRE, DL_HEALTH_FRESH, DL_HEALTH_JQ; paths cannot contain spaces): ${compile_err:0:300}"
+    return 3
+  fi
   DL_STAMP=$(date -u +%Y%m%dT%H%M%SZ)
   return 0
 }
+
 
 # The state dir expression, expanded by the shell that runs dl_sh.
 _dl_state_dir() {
@@ -240,10 +289,15 @@ _dl_state_dir() {
   fi
 }
 
-# The commit the box says is deployed now (empty when unknown).
+# The commit the box says is deployed now. Prints the sha, or nothing when the
+# box has no record yet. Returns 1 when the record could not be read at all.
 dl_read_deployed_sha() {
-  dl_sh "f=\"$(_dl_state_dir)/deployed-sha\"; [ -f \"\$f\" ] && cat \"\$f\" || true" \
-    2>/dev/null | head -n 1 | tr -cd '0-9a-f'
+  local out
+  out=$(dl_sh "f=\"$(_dl_state_dir)/deployed-sha\"; if [ -f \"\$f\" ]; then cat \"\$f\"; else echo NONE; fi") \
+    || return 1
+  out=$(printf '%s\n' "$out" | head -n 1)
+  [[ "$out" == NONE ]] && return 0
+  printf '%s' "$out" | tr -cd '0-9a-f'
 }
 
 dl_write_deployed_sha() {
@@ -251,32 +305,43 @@ dl_write_deployed_sha() {
     "$DL_FULL_SHA"
 }
 
-# Record every service's running image as <repo>:pre-<sha>.
-# Sets DL_PRE (lines of "service repo tag") for dl_rollback.
+# Tag every service's running image as <repo>:pre-<stamp>-<sha>. Each run tags
+# what runs NOW, so redeploying an older commit never reuses a stale tag.
+# Sets DL_PRE (lines of "service repo tag pre-tag") and DL_UNRECORDED.
 dl_record_pre() {
   DL_PRE=""
+  DL_UNRECORDED=""
+  DL_PRE_TAG="pre-$DL_STAMP-$DL_SHORT_SHA"
   local svc image id repo tag services
   services=$(dl_services) || { dl_err "could not list compose services"; return 1; }
   for svc in $services; do
     image=$(dl_image_for "$svc") || { dl_err "could not read the image name for $svc"; return 1; }
     read -r repo tag <<<"$(_dl_split_image "$image")"
-    if dl_docker image inspect --format '{{.Id}}' "$repo:pre-$DL_SHORT_SHA" >/dev/null 2>&1; then
-      # An earlier run of this same commit already recorded what ran before
-      # it. Overwriting would replace that with this commit's own image.
-      dl_log "rollback point: $svc keeps $repo:pre-$DL_SHORT_SHA from an earlier run"
-      DL_PRE+="$svc $repo $tag"$'\n'
-      continue
-    fi
     id=$(dl_running_image_id "$svc") || { dl_err "could not inspect $svc"; return 1; }
     if [[ -z "$id" ]]; then
       dl_warn "$svc is not running, so it has no rollback point"
+      DL_UNRECORDED+="$svc "
       continue
     fi
-    dl_docker tag "$id" "$repo:pre-$DL_SHORT_SHA" \
-      || { dl_err "could not tag $svc's running image as $repo:pre-$DL_SHORT_SHA"; return 1; }
-    dl_log "rollback point: $svc runs $repo:pre-$DL_SHORT_SHA"
+    dl_docker tag "$id" "$repo:$DL_PRE_TAG" \
+      || { dl_err "could not tag $svc's running image as $repo:$DL_PRE_TAG"; return 1; }
+    dl_log "rollback point: $svc runs $repo:$DL_PRE_TAG"
     DL_PRE+="$svc $repo $tag"$'\n'
   done
+  return 0
+}
+
+# Keep only the newest DL_SNAPSHOT_KEEP pre- tags per image. Best effort.
+dl_prune_pre_tags() {
+  local keep="${DL_SNAPSHOT_KEEP:-5}" svc repo tag old
+  while read -r svc repo tag; do
+    [[ -n "$svc" ]] || continue
+    while IFS= read -r old; do
+      [[ -n "$old" ]] || continue
+      dl_docker rmi "$repo:$old" >/dev/null 2>&1 || dl_warn "could not remove old tag $repo:$old"
+    done < <(dl_docker image ls --format '{{.Tag}}' "$repo" 2>/dev/null | grep '^pre-' \
+               | sort -r | tail -n +$((keep + 1)))
+  done <<<"${DL_PRE:-}"
   return 0
 }
 
@@ -305,8 +370,13 @@ exit 0"
   return 0
 }
 
+# Put the compose dir back from the snapshot. Returns 1 if that failed, 2 if
+# there is no snapshot (DL_SNAPSHOT=0), 0 when restored.
 dl_restore_snapshot() {
-  [[ -n "${DL_SNAPSHOT_FILE:-}" ]] || return 0
+  if [[ -z "${DL_SNAPSHOT_FILE:-}" ]]; then
+    dl_warn "no files snapshot (DL_SNAPSHOT=0), so the compose directory was NOT restored"
+    return 2
+  fi
   if dl_sh "tar -xzf \"$(_dl_state_dir)/\$1\" -C ." "$DL_SNAPSHOT_FILE"; then
     dl_log "restored the compose directory from $DL_SNAPSHOT_FILE"
     return 0
@@ -328,7 +398,7 @@ done
 for item in $2; do
   f=${item%%:*}; v=${item#*:}
   if [ ! -s "$f" ]; then echo "missing or empty: $f (needed for $v)"; bad=1; continue; fi
-  val=$(grep -E "^[[:space:]]*(export[[:space:]]+)?$v=" "$f" | tail -n 1 | sed -E 's/^[^=]*=//' | tr -d "\"' \t\r")
+  val=$(grep -E "^[[:space:]]*(export[[:space:]]+)?$v=" "$f" | tail -n 1 | sed -E 's/^[^=]*=//; s/[[:space:]]+#.*$//' | tr -d "\"' \t\r")
   [ -n "$val" ] || { echo "$f has no value for $v"; bad=1; }
 done
 exit $bad
@@ -343,8 +413,13 @@ SCRIPT
   return 1
 }
 
+# Text safe inside a jq string literal.
+_dl_jq_text() { local t="${1//\\/\\\\}"; printf '%s' "${t//\"/\\\"}"; }
+
 # jq program: true when every requirement holds; otherwise prints the first
-# failure as a string and exits false.
+# failure as a string and exits 1. Every check collects ALL values a path
+# yields, so a path that yields nothing (an empty array, a select that drops
+# everything) fails instead of silently passing.
 _dl_health_program() {
   # shellcheck disable=SC2016  # a jq program; its $vars are jq variables
   local prog='def epoch:
@@ -359,13 +434,15 @@ _dl_health_program() {
              * (if $o.sign == "+" then 1 else -1 end))
       else ($s[0:19] + "Z" | fromdateiso8601) end
   else null end;
-[ ' first=1 p age
+def bad: . == null or . == false or . == "";
+[ ' first=1 p age txt
   local path
   # shellcheck disable=SC2086  # a word list on purpose
   for path in ${DL_HEALTH_REQUIRE:-}; do
     [[ $first == 1 ]] || prog+=', '
     first=0
-    prog+="(try ($path) catch null) as \$v | if (\$v == null or \$v == false or \$v == \"\") then \"required $path is missing or false\" else empty end"
+    txt=$(_dl_jq_text "$path")
+    prog+="([ try ($path) catch null ] as \$vs | if (\$vs | length) == 0 or (\$vs | any(bad)) then \"required $txt is missing or false\" else empty end)"
   done
   local line
   while IFS= read -r line; do
@@ -373,11 +450,21 @@ _dl_health_program() {
     read -r p age <<<"$line"
     [[ $first == 1 ]] || prog+=', '
     first=0
-    prog+="((try ($p) catch null) as \$t | (try (\$t | epoch) catch null) as \$e | if \$e == null then \"fresh $p is missing or not a timestamp\" elif (now - \$e) > $age then \"fresh $p is \\(((now - \$e) / 60 | floor)) min old (limit $age s)\" else empty end)"
+    txt=$(_dl_jq_text "$p")
+    prog+="([ try ($p) catch null ] as \$ts | [ \$ts[] | (try epoch catch null) ] as \$es"
+    prog+=" | if (\$es | length) == 0 or (\$es | any(. == null)) then \"fresh $txt is missing or not a timestamp\""
+    prog+=" elif (\$es | map(. - now) | max) > 300 then \"fresh $txt is in the future (\\(((\$es | map(. - now) | max) / 60 | floor)) min ahead); the clock or the value is wrong\""
+    prog+=" elif (\$es | map(now - .) | max) > $age then \"fresh $txt is \\(((\$es | map(now - .) | max) / 60 | floor)) min old (limit $age s)\" else empty end)"
   done <<<"${DL_HEALTH_FRESH:-}"
   if [[ -n "$(_dl_trim "${DL_HEALTH_JQ:-}")" ]]; then
     [[ $first == 1 ]] || prog+=', '
-    prog+="(if (try (${DL_HEALTH_JQ}) catch false) then empty else \"DL_HEALTH_JQ predicate is not true\" end)"
+    first=0
+    prog+="([ try (${DL_HEALTH_JQ}) catch false ] as \$ok | if (\$ok | length) > 0 and (\$ok | all(. == true)) then empty else \"DL_HEALTH_JQ predicate is not true\" end)"
+  fi
+  if [[ -n "$(_dl_trim "${DL_HEALTH_COMMIT:-}")" && -n "${DL_FULL_SHA:-}" ]]; then
+    [[ $first == 1 ]] || prog+=', '
+    txt=$(_dl_jq_text "$DL_HEALTH_COMMIT")
+    prog+="([ try (${DL_HEALTH_COMMIT}) catch null ] as \$cs | if (\$cs | length) == 1 and (\$cs[0] | type) == \"string\" and (\$cs[0] | length) >= 7 and (\"$DL_FULL_SHA\" | startswith(\$cs[0])) then empty else \"commit $txt is \\(\$cs | tostring), not the deployed $DL_SHORT_SHA\" end)"
   fi
   prog+=' ] | if length == 0 then true else (.[0] | halt_error(1)) end'
   printf '%s' "$prog"
@@ -385,14 +472,22 @@ _dl_health_program() {
 
 # One health probe. Prints the reason on failure.
 dl_health_once() {
-  local body
+  # stderr is kept apart from the body: a curl or ssh warning must never be
+  # read as the response.
+  local body errf ok=1
+  errf=$(mktemp "${TMPDIR:-/tmp}/dl-health.XXXXXX") || { printf 'mktemp failed'; return 1; }
   if [[ "${DL_HEALTH_FROM:-local}" == remote ]]; then
-    body=$(ssh -o BatchMode=yes "$DL_REMOTE" "curl -fsS --max-time 10 $(printf '%q' "$DL_HEALTH_URL")" 2>&1) \
-      || { printf 'request failed: %s' "${body:0:200}"; return 1; }
+    body=$(ssh -o BatchMode=yes -o LogLevel=ERROR "$DL_REMOTE" \
+      "curl -fsS --max-time 10 $(printf '%q' "$DL_HEALTH_URL")" 2>"$errf") || ok=0
   else
-    body=$(curl -fsS --max-time 10 "$DL_HEALTH_URL" 2>&1) \
-      || { printf 'request failed: %s' "${body:0:200}"; return 1; }
+    body=$(curl -fsS --max-time 10 "$DL_HEALTH_URL" 2>"$errf") || ok=0
   fi
+  if [[ $ok == 0 ]]; then
+    printf 'request failed: %s' "$(head -c 200 "$errf")"
+    rm -f "$errf"
+    return 1
+  fi
+  rm -f "$errf"
   if ! printf '%s' "$body" | jq -e . >/dev/null 2>&1; then
     printf 'response is not JSON: %s' "${body:0:200}"
     return 1
@@ -405,13 +500,22 @@ dl_health_once() {
   return 1
 }
 
-# Poll until healthy or DL_HEALTH_TIMEOUT seconds pass.
+# Poll until healthy or DL_HEALTH_TIMEOUT seconds pass, then check once more
+# after DL_HEALTH_SETTLE seconds (an app that answers and then crash-loops).
 dl_wait_healthy() {
   local timeout="${DL_HEALTH_TIMEOUT:-120}" interval="${DL_HEALTH_INTERVAL:-5}"
+  local settle="${DL_HEALTH_SETTLE:-10}"
   local start=$SECONDS reason tries=0
   while :; do
     tries=$((tries + 1))
     if reason=$(dl_health_once); then
+      if [[ "$settle" != 0 && "$settle" != 0.0 ]]; then
+        sleep "$settle"
+        if ! reason=$(dl_health_once); then
+          dl_err "healthy once, then not healthy ${settle}s later: $reason"
+          return 1
+        fi
+      fi
       dl_log "healthy after $tries check(s): $DL_HEALTH_URL"
       return 0
     fi
@@ -423,13 +527,13 @@ dl_wait_healthy() {
   done
 }
 
-# The exact commands that put the recorded images back.
+# The exact commands that put the recorded files and images back.
 dl_rollback_command() {
   [[ -n "${DL_PRE:-}" ]] || { echo "(no image rollback point was recorded)"; return 0; }
   local svc repo tag cmds="" svcs=""
   while read -r svc repo tag; do
     [[ -n "$svc" ]] || continue
-    cmds+="docker tag $repo:pre-$DL_SHORT_SHA $repo:$tag && "
+    cmds+="docker tag $repo:$DL_PRE_TAG $repo:$tag && "
     svcs+=" $svc"
   done <<<"$DL_PRE"
   local compose_args="" restore=""
@@ -449,8 +553,8 @@ dl_rollback() {
   local svc repo tag svcs=()
   while read -r svc repo tag; do
     [[ -n "$svc" ]] || continue
-    dl_docker tag "$repo:pre-$DL_SHORT_SHA" "$repo:$tag" \
-      || { dl_err "could not retag $repo:pre-$DL_SHORT_SHA"; return 1; }
+    dl_docker tag "$repo:$DL_PRE_TAG" "$repo:$tag" \
+      || { dl_err "could not retag $repo:$DL_PRE_TAG"; return 1; }
     svcs+=("$svc")
   done <<<"$DL_PRE"
   dl_compose up -d --no-build --force-recreate "${svcs[@]}" \
@@ -475,7 +579,10 @@ dl_git_tag() {
 dl_tag_rollback_point() {
   [[ "${DL_TAG_PUSH:-1}" == 1 ]] || return 0
   local prev gitdir="${DL_GIT_DIR:-.}"
-  prev=$(dl_read_deployed_sha)
+  if ! prev=$(dl_read_deployed_sha); then
+    dl_warn "could not read the box's deployed-commit record, so git gets no rollback-point tag this time"
+    return 1
+  fi
   if [[ -z "$prev" ]]; then
     dl_warn "the box does not record which commit it runs yet (first deploy with this library); only the image and file snapshot mark the rollback point"
     return 0
@@ -485,20 +592,48 @@ dl_tag_rollback_point() {
     return 0
   fi
   dl_git_tag "rollback-point/$DL_SERVICE/$DL_STAMP" "$prev" \
-    "Running on $DL_SERVICE before deploying $DL_SHORT_SHA at $DL_STAMP. Images: <image>:pre-$DL_SHORT_SHA. Files: ${DL_SNAPSHOT_FILE:-none}."
+    "Running on $DL_SERVICE before deploying $DL_SHORT_SHA at $DL_STAMP. Images: <image>:$DL_PRE_TAG. Files: ${DL_SNAPSHOT_FILE:-none}."
 }
 
-# Undo files after a failure before anything restarted.
+# Undo files after a failure before anything restarted. 0 when the box is
+# back as it was; 2 when it could not be put back.
 _dl_abort_before_restart() {
-  dl_restore_snapshot || dl_err "the compose directory may be half-synced; restore it by hand"
+  local rc=0
+  dl_restore_snapshot || rc=$?
+  case $rc in
+    0) return 0 ;;
+    2) dl_err "nothing was restarted, but dl_sync's changes are still in $DL_COMPOSE_DIR (snapshots are off)"; return 2 ;;
+    *) dl_err "nothing was restarted, but the compose directory may be half-synced; restore it by hand"; return 2 ;;
+  esac
+}
+
+# If the shell dies after the restart (Ctrl-C, ssh drop, set -u), say so.
+_dl_on_exit() {
+  local rc=$?
+  case "${DL_PHASE:-}" in
+    restarting|checking|rolling-back)
+      dl_err "deploy ABORTED during '$DL_PHASE'; the service state is unknown. To roll back by hand:"
+      dl_rollback_command >&2
+      ;;
+  esac
+  DL_PHASE=""
+  trap - EXIT INT TERM HUP
+  exit "$rc"
 }
 
 dl_run() {
-  local rc=0 tag_rc=0
+  local tag_rc=0 rc
+  DL_PHASE=""
   dl_preflight || return 3
   local services
   services=$(dl_services) || { dl_err "could not list compose services"; return 3; }
   dl_log "deploying $DL_SHORT_SHA (services: ${services//$'\n'/ }) with deploy-lib $DL_LIB_VERSION"
+  # A gate that cannot even read the current version is worth knowing about
+  # before anything changes (for example curl missing on the box).
+  local now_reason
+  if ! now_reason=$(DL_PROBE=pre dl_health_once); then
+    dl_warn "the version running now does not pass the health gate: $now_reason"
+  fi
   dl_record_pre || { dl_err "stopping before deploy: could not record rollback points"; return 3; }
   dl_snapshot || { dl_err "stopping before deploy: could not snapshot the compose directory"; return 3; }
   dl_tag_rollback_point || tag_rc=4
@@ -507,22 +642,28 @@ dl_run() {
     dl_log "running dl_sync"
     if ! dl_sync; then
       dl_err "dl_sync failed; putting the files back, nothing was restarted"
-      _dl_abort_before_restart
-      return 1
+      _dl_abort_before_restart && return 1
+      return 2
     fi
   fi
   if ! dl_check_required; then
     dl_err "refusing to restart with required files or settings missing; putting the files back"
-    _dl_abort_before_restart
-    return 3
+    _dl_abort_before_restart && return 3
+    return 2
   fi
 
+  trap '_dl_on_exit' EXIT INT TERM HUP
+  DL_PHASE=restarting
   # shellcheck disable=SC2086  # DL_UP_ARGS and DL_SERVICES are word lists on purpose
   if dl_compose ${DL_UP_ARGS:-up -d --build} ${DL_SERVICES:-}; then
+    DL_PHASE=checking
     if dl_wait_healthy; then
-      dl_write_deployed_sha || { dl_warn "could not record the deployed commit on the box"; tag_rc=4; }
+      DL_PHASE=""
+      trap - EXIT INT TERM HUP
+      dl_write_deployed_sha || { dl_err "could not record the deployed commit on the box"; tag_rc=4; }
       dl_git_tag "deploy/$DL_SERVICE/$DL_STAMP-$DL_SHORT_SHA" "$DL_FULL_SHA" \
         "Deployed $DL_SERVICE at $DL_SHORT_SHA ($DL_STAMP), healthy." || tag_rc=4
+      dl_prune_pre_tags
       dl_log "deploy OK. To roll back to what ran before:"
       dl_rollback_command >&2
       return "$tag_rc"
@@ -531,23 +672,37 @@ dl_run() {
     dl_err "docker compose up failed"
   fi
 
+  DL_PHASE=rolling-back
   dl_git_tag "failed-deploy/$DL_SERVICE/$DL_STAMP-$DL_SHORT_SHA" "$DL_FULL_SHA" \
     "Deploy of $DL_SERVICE at $DL_SHORT_SHA ($DL_STAMP) was unhealthy and rolled back." || true
   if [[ -z "${DL_PRE:-}" ]]; then
     dl_restore_snapshot || true
+    DL_PHASE=""
+    trap - EXIT INT TERM HUP
     dl_err "no image rollback point was recorded, so nothing can be rolled back. SERVICE IS DOWN."
     return 2
   fi
   dl_warn "rolling back to the files and images recorded before this deploy"
-  rc=0
-  dl_restore_snapshot || rc=1
-  if [[ $rc == 0 ]] && dl_rollback && dl_wait_healthy; then
+  local files_rc=0
+  dl_restore_snapshot || files_rc=$?
+  rc=2
+  if dl_rollback && dl_wait_healthy; then
+    rc=1
     dl_err "deploy of $DL_SHORT_SHA failed; rolled back and the old version is healthy"
+    if [[ $files_rc != 0 ]]; then
+      dl_err "BUT the compose directory was not restored; the old images run with the new files. Check it by hand."
+    fi
+    if [[ -n "${DL_UNRECORDED:-}" ]]; then
+      dl_err "BUT these services had no rollback point and still run the new build: $DL_UNRECORDED"
+      rc=2
+    fi
     dl_log "the rollback ran:"
     dl_rollback_command >&2
-    return 1
+  else
+    dl_err "ROLLBACK FAILED. SERVICE IS DOWN. Run this by hand, then check $DL_HEALTH_URL:"
+    dl_rollback_command >&2
   fi
-  dl_err "ROLLBACK FAILED. SERVICE IS DOWN. Run this by hand, then check $DL_HEALTH_URL:"
-  dl_rollback_command >&2
-  return 2
+  DL_PHASE=""
+  trap - EXIT INT TERM HUP
+  return "$rc"
 }

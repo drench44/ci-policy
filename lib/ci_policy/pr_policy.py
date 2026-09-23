@@ -76,9 +76,12 @@ _BAND_PATTERNS = [
     re.compile(r"^[\s>*_#`-]*band\b[^\n]{0,60}?\b" + _COUNT + r"\b", re.I | re.M),
     # "(band 1, CI change)", "band: 3"
     re.compile(r"\bband\s*[:=]?\s*[*_`]*\s*([0-3])\b", re.I),
-    # "three-agent band", "All three review agents ran", "ZERO agents", "one agent"
+    # "three-agent band", "All three review agents ran", "ZERO agents per the band".
+    # Only counts on a line that also talks about review or the band, so "no
+    # agents overlap" in a layout fix is not read as a band statement.
     re.compile(r"\b" + _COUNT + r"[\s-]+(?:review[\s-]+)?agents?\b", re.I),
 ]
+_REVIEW_CONTEXT = re.compile(r"review|\bband\b", re.I)
 
 
 def strip_comments(text: str) -> str:
@@ -88,9 +91,14 @@ def strip_comments(text: str) -> str:
 
 def find_band(body: str) -> Tuple[Optional[int], str]:
     """Return (number of review agents, the matching text), or (None, "")."""
-    for pattern in _BAND_PATTERNS:
-        m = pattern.search(body)
-        if m:
+    for index, pattern in enumerate(_BAND_PATTERNS):
+        for m in pattern.finditer(body):
+            if index == len(_BAND_PATTERNS) - 1:
+                start = body.rfind("\n", 0, m.start()) + 1
+                end = body.find("\n", m.end())
+                line = body[start:end if end != -1 else len(body)]
+                if not _REVIEW_CONTEXT.search(line):
+                    continue
             word = re.sub(r"\s+", " ", m.group(1).lower())
             value = 3 if word == "all three" else _COUNT_VALUE[word]
             return value, m.group(0).strip(" \t*_#>`-")
@@ -164,6 +172,7 @@ class PullRequest:
     author_is_bot: bool
     files: List[FileChange] = field(default_factory=list)
     labels: List[str] = field(default_factory=list)
+    files_complete: bool = True
 
 
 @dataclass
@@ -265,7 +274,9 @@ def evaluate(pr: PullRequest, cfg: Config) -> Result:
     note = (f" ({ignored_size} more lines in {len(ignored)} lockfile, generated or vendored "
             "file(s) not counted)" if ignored else "")
     biggest = [f"`{f.path}` {f.changes}" for f in sorted(counted, key=lambda f: -f.changes)[:5]]
-    if size > cfg.size_fail:
+    if not pr.files_complete:
+        note += "; GitHub listed only part of the changed files, so the real size is larger"
+    if size > cfg.size_fail or not pr.files_complete:
         reason = _line_value(_OVERRIDE_LINE, body)
         if _has_label(pr, cfg.size_label):
             checks.append(Check("size", "warn",
@@ -277,7 +288,9 @@ def evaluate(pr: PullRequest, cfg: Config) -> Result:
                                 f"by `Size-override: {reason}`{note}.", biggest))
         else:
             checks.append(Check("size", "fail",
-                                f"{size} changed lines is over the {cfg.size_fail} limit{note}.",
+                                (f"{size} changed lines is over the {cfg.size_fail} limit{note}."
+                                 if pr.files_complete else
+                                 f"at least {size} changed lines{note}."),
                                 [f"Split the PR, or add the `{cfg.size_label}` label, or add a "
                                  "`Size-override: <reason>` line to the body."] + biggest))
     elif size > cfg.size_warn:
@@ -361,9 +374,10 @@ def fetch_pull_request(api: gh.GitHub, repo: str, number: int) -> Tuple[PullRequ
     files = api.paginate(f"/repos/{repo}/pulls/{number}/files")
     changed_files = pr.get("changed_files")
     if isinstance(changed_files, int) and len(files) < changed_files:
-        # The files API stops at 3000 files; say so rather than under-count.
+        # The files API stops at 3000 files. The size cannot be trusted, so the
+        # size rule treats the PR as over the limit (see evaluate).
         gh.annotate("warning", f"GitHub listed {len(files)} of {changed_files} changed files; "
-                    "the size check only sees those.", "pr-policy")
+                    "treating the PR as over the size limit.", "pr-policy")
     user = pr.get("user") or {}
     login = user.get("login") or ""
     return PullRequest(
@@ -377,6 +391,7 @@ def fetch_pull_request(api: gh.GitHub, repo: str, number: int) -> Tuple[PullRequ
                           status=f.get("status", "modified"),
                           previous_path=f.get("previous_filename")) for f in files],
         labels=[label.get("name", "") for label in pr.get("labels") or []],
+        files_complete=not (isinstance(changed_files, int) and len(files) < changed_files),
     ), ((pr.get("base") or {}).get("sha") or "")
 
 

@@ -22,13 +22,19 @@ conf_dir=$(cd "$(dirname "$conf")" && pwd -P)
 # shellcheck source=deploy-lib.sh
 source "$here/deploy-lib.sh"
 DL_GIT_DIR=$(git -C "$conf_dir" rev-parse --show-toplevel 2>/dev/null || printf '%s' "$conf_dir")
+# A config that fails to load (a syntax error half way) would leave later
+# settings, like the required-file checks, unset. Refuse instead.
 # shellcheck disable=SC1090  # the per-repo config
-source "$conf"
+if ! source "$conf"; then
+  echo "homelab-deploy: $conf failed to load; refusing to deploy" >&2
+  exit 3
+fi
 
 case "$mode" in
   deploy) dl_run; exit $? ;;
   --health)
     dl_preflight || exit 3
+    DL_FULL_SHA=""  # judge what runs now, not the checkout
     if reason=$(dl_health_once); then
       dl_log "healthy: $DL_HEALTH_URL"
       exit 0
