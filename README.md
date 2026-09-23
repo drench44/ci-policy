@@ -151,7 +151,10 @@ when liveness does not answer.
 Git tags are pushed only to a remote known to be private (a GitHub remote is
 asked with `gh api`; a local path counts as private; another host needs
 `DL_TAG_REMOTE_PRIVATE=1`), or the deploy stops before changing anything. A
-public repo sets `DL_TAG_PUSH=local`: the tags stay in the deploying clone.
+public repo sets `DL_TAG_PUSH=local`: the record goes into the deploying clone
+as refs under `refs/deploy-history/` (not tags, which a release's
+`--follow-tags` push would publish; list them with
+`git for-each-ref refs/deploy-history`).
 Every outcome is also appended to `deploys.log` in the service's state dir on
 the box, so the record exists either way.
 
@@ -159,7 +162,9 @@ Exit codes: 0 ok; 1 rolled back and the old version passes what it passed
 before; 2 down, liveness fails (manual command printed); 3 refused before
 restarting; 4 deployed but a tag could not be made or pushed; 5 up but not as
 intended (the rollback is incomplete, or the old version answers liveness but
-fails a check it passed before).
+fails a check it passed before); 6 nothing restarted, but the files a failed
+sync put on the box could not be taken back off (the next restart would use
+them).
 `homelab-deploy <config> --health` runs the gate once against what runs now.
 
 ## Tests

@@ -64,6 +64,9 @@ DL_LIB_VERSION="2.2.0"
 #   5  up but not as intended: the service answers liveness, but the rollback
 #      is incomplete (a service had no rollback point, the files could not be
 #      put back) or the old version fails a check it passed before the deploy
+#   6  nothing restarted, but dl_sync's files could not be taken back off the
+#      box: the running containers are fine, the NEXT restart is not. Put the
+#      files back by hand (the message says how) before anything restarts.
 #
 # Settings:
 #   DL_SERVICE          required. Name used in tags, state and messages.
@@ -96,6 +99,9 @@ DL_LIB_VERSION="2.2.0"
 #                       example /health), the least a rolled-back version must
 #                       prove. Default: DL_HEALTH_URL answering 2xx at all.
 #                       Fetched the same way as DL_HEALTH_URL (DL_HEALTH_FROM).
+#   DL_PRE_PROBE_TRIES  tries of the full gate on the version running before the
+#                       deploy (DL_HEALTH_INTERVAL apart) before a rollback to
+#                       it is judged by liveness instead. Default 3.
 #   DL_HEALTH_TIMEOUT   seconds to wait for healthy. Default 120.
 #   DL_HEALTH_INTERVAL  seconds between polls. Default 5.
 #   DL_REQUIRE_FILES    files (relative to DL_COMPOSE_DIR) that must exist and be
@@ -112,8 +118,10 @@ DL_LIB_VERSION="2.2.0"
 #   DL_GIT_DIR          repo being deployed. Default: current directory.
 #   DL_SHA              optional; if set it must equal HEAD (the checkout is what ships).
 #   DL_GIT_REMOTE       where tags are pushed. Default origin.
-#   DL_TAG_PUSH         1 = create and push git tags (default); local = create
-#                       them in DL_GIT_DIR only, never push; 0 = no tags.
+#   DL_TAG_PUSH         1 = create and push git tags (default); local = record
+#                       them in DL_GIT_DIR as refs/deploy-history/<name>, not
+#                       as tags (a release's --follow-tags push would publish
+#                       tags), never pushed; 0 = no tags.
 #                       Pushing is refused (exit 3 before anything changes)
 #                       unless the remote is known to be private: a GitHub
 #                       remote is asked (gh api) and must be private; a local
@@ -121,7 +129,9 @@ DL_LIB_VERSION="2.2.0"
 #                       needs DL_TAG_REMOTE_PRIVATE=1. A deploy history does
 #                       not belong in a public repo, so a public repo's config
 #                       sets DL_TAG_PUSH=local (or, only when that is really
-#                       intended, DL_TAG_PUSH_PUBLIC=1).
+#                       intended, DL_TAG_PUSH_PUBLIC=1). Every push URL of the
+#                       remote is checked (pushurl, pushInsteadOf), and only
+#                       a deploy checks (--health makes no tags).
 #   DL_TAG_PUSH_PUBLIC=1    allow pushing tags to a PUBLIC remote (not advised).
 #   DL_TAG_REMOTE_PRIVATE=1 the remote is private but not on GitHub.
 #   DL_ALLOW_DIRTY      1 = allow deploying with uncommitted changes. Default 0.
@@ -327,7 +337,6 @@ dl_preflight() {
     fi
   fi
   DL_SHORT_SHA="${DL_FULL_SHA:0:12}"
-  _dl_check_tag_remote || return 3
   # A typo in a jq path must be a config error now, not an "unhealthy" deploy
   # that rolls back a working service later. jq exits 3 on a compile error.
   local compile_rc=0 compile_err
@@ -353,16 +362,31 @@ _dl_check_tag_remote() {
     *) dl_err "DL_TAG_PUSH must be 1, local or 0, not '${DL_TAG_PUSH}'"; return 1 ;;
   esac
   [[ "${DL_TAG_PUSH_PUBLIC:-0}" == 1 ]] && return 0
-  local gitdir="${DL_GIT_DIR:-.}" remote="${DL_GIT_REMOTE:-origin}" url slug vis
-  url=$(git -C "$gitdir" remote get-url "$remote" 2>/dev/null) \
-    || { dl_err "DL_GIT_REMOTE '$remote' is not a remote of $gitdir (or set DL_TAG_PUSH=local)"; return 1; }
+  local gitdir="${DL_GIT_DIR:-.}" remote="${DL_GIT_REMOTE:-origin}" urls url
+  # Where a push really goes: the push URL(s) (pushurl, pushInsteadOf), not
+  # the fetch URL. Every one of them must be private.
+  urls=$(git -C "$gitdir" remote get-url --push --all "$remote" 2>/dev/null) || urls=""
+  if [[ -z "$urls" ]]; then
+    dl_err "DL_GIT_REMOTE '$remote' is not a remote of $gitdir (or set DL_TAG_PUSH=local)"
+    return 1
+  fi
+  while IFS= read -r url; do
+    [[ -n "$url" ]] || continue
+    _dl_url_is_private "$url" || return 1
+  done <<<"$urls"
+  return 0
+}
+
+# One push URL: 0 when it is known to be private, else says why and returns 1.
+_dl_url_is_private() {
+  local url="$1" slug vis
   case "$url" in
     /*|./*|../*|file://*) return 0 ;;
   esac
   if [[ "$url" =~ github\.com[:/]([^/]+/[^/]+)$ ]]; then
     slug="${BASH_REMATCH[1]%.git}"
     if ! command -v gh >/dev/null 2>&1; then
-      dl_err "cannot tell whether $slug is private (gh is not installed), so its deploy tags will not be pushed. Install gh, or set DL_TAG_PUSH=local (tags stay in this clone)."
+      dl_err "cannot tell whether $slug is private (gh is not installed), so its deploy tags will not be pushed. Install gh, or set DL_TAG_PUSH=local (the record stays in this clone)."
       return 1
     fi
     if ! vis=$(gh api "repos/$slug" --jq .private 2>&1); then
@@ -373,7 +397,7 @@ _dl_check_tag_remote() {
       return 0
     fi
     if [[ "$vis" == false ]]; then
-      dl_err "$slug is PUBLIC: deploy tags (rollback-point/, deploy/, failed-deploy/) would publish this service's deploy history. Set DL_TAG_PUSH=local in the config (tags stay in this clone; the box keeps deploys.log), or DL_TAG_PUSH_PUBLIC=1 if publishing them is intended."
+      dl_err "$slug is PUBLIC: deploy tags (rollback-point/, deploy/, failed-deploy/) would publish this service's deploy history. Set DL_TAG_PUSH=local in the config (the record stays in this clone; the box keeps deploys.log), or DL_TAG_PUSH_PUBLIC=1 if publishing them is intended."
       return 1
     fi
     dl_err "gh api repos/$slug answered '${vis:0:80}' for .private, not true or false; not pushing tags there. Set DL_TAG_PUSH=local."
@@ -741,12 +765,22 @@ dl_rollback() {
 dl_git_tag() {
   [[ "${DL_TAG_PUSH:-1}" == 0 ]] && return 0
   local gitdir="${DL_GIT_DIR:-.}" tag="$1" commit="$2" msg="$3"
-  git -C "$gitdir" tag -a "$tag" "$commit" -m "$msg" \
-    || { dl_err "could not create git tag $tag"; return 1; }
   if [[ "${DL_TAG_PUSH:-1}" == local ]]; then
-    dl_log "git tag $tag (in $gitdir only; DL_TAG_PUSH=local never pushes it)"
+    # NOT a tag: a release's `--follow-tags` push (how the public engines
+    # release) would publish an annotated tag on a pushed commit, and
+    # `--tags` any tag. A ref under refs/deploy-history/ is left alone by
+    # every default push. List them: git for-each-ref refs/deploy-history
+    local full obj
+    full=$(git -C "$gitdir" rev-parse --verify "$commit^{commit}" 2>/dev/null) \
+      && obj=$(printf 'object %s\ntype commit\ntag %s\ntagger homelab-deploy <homelab-deploy@localhost> %s +0000\n\n%s\n' \
+                 "$full" "$tag" "$(date +%s)" "$msg" | git -C "$gitdir" mktag 2>/dev/null) \
+      && git -C "$gitdir" update-ref "refs/deploy-history/$tag" "$obj" \
+      || { dl_err "could not record refs/deploy-history/$tag in $gitdir"; return 1; }
+    dl_log "recorded refs/deploy-history/$tag in $gitdir (DL_TAG_PUSH=local: a private ref, never pushed)"
     return 0
   fi
+  git -C "$gitdir" tag -a "$tag" "$commit" -m "$msg" \
+    || { dl_err "could not create git tag $tag"; return 1; }
   # Never a credential prompt in the middle of a deploy: fail, and say so.
   GIT_TERMINAL_PROMPT=0 git -C "$gitdir" push -q "${DL_GIT_REMOTE:-origin}" "refs/tags/$tag" </dev/null \
     || { dl_err "created $tag but could not push it; run: git push ${DL_GIT_REMOTE:-origin} refs/tags/$tag"; return 1; }
@@ -776,15 +810,16 @@ dl_tag_rollback_point() {
 }
 
 # Undo files after a failure before anything restarted. 0 when the box is
-# back as it was; 5 when it could not be put back (the old containers still
-# run, nothing restarted, but the files on the box are not what they run).
+# back as it was; 6 when it could not be put back (nothing restarted, the old
+# containers still run, but the files on the box are not what they run: the
+# next restart would start on them).
 _dl_abort_before_restart() {
   local rc=0
   dl_restore_snapshot || rc=$?
   case $rc in
     0) return 0 ;;
-    2) dl_err "nothing was restarted, but dl_sync's changes are still in $DL_COMPOSE_DIR (snapshots are off)"; return 5 ;;
-    *) dl_err "nothing was restarted, but the compose directory may be half-synced; restore it by hand"; return 5 ;;
+    2) dl_err "nothing was restarted, but dl_sync's changes are still in $DL_COMPOSE_DIR (snapshots are off)"; return 6 ;;
+    *) dl_err "nothing was restarted, but the compose directory may be half-synced; restore it by hand"; return 6 ;;
   esac
 }
 
@@ -816,15 +851,22 @@ _dl_on_exit() {
 # dl_health_extra passed too) and DL_PRE_LIVE (0/1: it answered liveness).
 dl_probe_running() {
   DL_ROLLBACK_GATE=full DL_ROLLBACK_EXTRA=0 DL_PRE_LIVE=1
-  local reason rc=0
+  local reason rc try tries="${DL_PRE_PROBE_TRIES:-3}"
   # The old version reports the old commit, so the commit check uses that
-  # one (none at all when the box has no deployed-commit record yet).
-  reason=$(DL_PROBE=pre DL_FULL_SHA="$DL_PREV_SHA" dl_health_once) || rc=$?
+  # one (none at all when the box has no deployed-commit record yet). A
+  # weaker rollback gate is chosen only when every try fails: one curl
+  # timeout or a fresh field between updates must not lower the bar.
+  for (( try = 1; try <= tries; try++ )); do
+    rc=0
+    reason=$(DL_PROBE=pre DL_FULL_SHA="$DL_PREV_SHA" dl_health_once) || rc=$?
+    (( rc == 0 || try == tries )) && break
+    sleep "${DL_HEALTH_INTERVAL:-5}"
+  done
   if (( rc == 0 )); then
     dl_log "the version running now passes the full health gate, so a rollback must pass it again"
     return 0
   fi
-  dl_warn "the version running now does not pass the health gate: $reason"
+  dl_warn "the version running now does not pass the health gate ($tries tries): $reason"
   if (( rc == 2 )); then
     # The JSON gate passed; only dl_health_extra failed.
     DL_ROLLBACK_GATE=json
@@ -872,6 +914,8 @@ dl_run() {
   local tag_rc=0 rc
   DL_PHASE=""
   dl_preflight || return 3
+  # Only a deploy makes tags (--health does not), so only a deploy asks.
+  _dl_check_tag_remote || return 3
   local services
   services=$(dl_services) || { dl_err "could not list compose services"; return 3; }
   dl_log "deploying $DL_SHORT_SHA (services: ${services//$'\n'/ }) with deploy-lib $DL_LIB_VERSION"

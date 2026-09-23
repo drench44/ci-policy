@@ -822,7 +822,7 @@ run_deploy DL_HEALTH_JQ= "DL_HEALTH_REQUIRE='.config.matches_deploy'" DL_LIVENES
   DL_HEALTH_TIMEOUT=3 DL_HEALTH_INTERVAL=0.2
 elapsed=$(( SECONDS - t0 ))
 assert_eq "$RC" 1 "$OUT"
-assert_contains "$OUT" "the version running now does not pass the health gate: required .config.matches_deploy is missing or false"
+assert_contains "$OUT" "the version running now does not pass the health gate (3 tries): required .config.matches_deploy is missing or false"
 assert_contains "$OUT" "so if this deploy fails, its rollback is judged by liveness (http://box/live)"
 assert_contains "$OUT" "not healthy after 3s"
 assert_contains "$OUT" "judging the rollback by liveness (http://box/live)"
@@ -891,9 +891,9 @@ setup "the old version passed the JSON gate but not dl_health_extra: the rollbac
 run_deploy DL_HEALTH_TIMEOUT=0 DL_TAG_PUSH=0 \
   "dl_health_extra() { echo \"\${DL_PROBE:-post}\" >>'$T/hook'; echo 'wyze-bridge exited'; return 1; }"
 assert_eq "$RC" 1 "$OUT"
-assert_contains "$OUT" "the version running now does not pass the health gate: dl_health_extra failed (exit 1): wyze-bridge exited"
+assert_contains "$OUT" "the version running now does not pass the health gate (3 tries): dl_health_extra failed (exit 1): wyze-bridge exited"
 assert_contains "$OUT" "judging the rollback by the health gate without dl_health_extra (http://box/health)"
-assert_eq "$(tr '\n' ' ' <"$T/hook")" "pre post " "(the hook ran for the pre probe and the new build, never for the rollback)"
+assert_eq "$(tr '\n' ' ' <"$T/hook")" "pre pre pre post " "(the hook ran for the three pre tries and the new build, never for the rollback)"
 teardown
 
 setup "the old version failed the JSON gate but passed dl_health_extra: the rollback must pass liveness AND the hook"
@@ -929,9 +929,9 @@ assert_eq "$RC" 2 "$OUT"
 assert_contains "$OUT" "ROLLBACK FAILED and liveness does not answer"
 teardown
 
-setup "a dl_sync failure with no snapshot to put back is 5: nothing restarted, files half-synced"
+setup "a dl_sync failure with no snapshot to put back is 6: nothing restarted, files half-synced"
 run_deploy DL_SNAPSHOT=0 "dl_sync() { return 1; }"
-assert_eq "$RC" 5 "$OUT"
+assert_eq "$RC" 6 "$OUT"
 assert_contains "$OUT" "dl_sync's changes are still in"
 teardown
 
@@ -943,17 +943,27 @@ assert_eq "$RC" 0 "$OUT"
 assert_contains "$(cat "$T/boxstate/deploys.log")" "hub deployed sha=$SHA prev=none images=pre-"
 teardown
 
-setup "DL_TAG_PUSH=local creates the tags in the clone and never pushes them"
+setup "DL_TAG_PUSH=local records private refs, not tags, and no release push publishes them"
 run_deploy DL_TAG_PUSH=local
 assert_eq "$RC" 0 "$OUT"
-assert_contains "$(git -C "$T/repo" tag -l 'deploy/hub/*')" "deploy/hub/"
-assert_eq "$(git -C "$T/origin.git" tag -l)" "" "(nothing pushed)"
-assert_contains "$OUT" "DL_TAG_PUSH=local never pushes it"
+hist() { git -C "$T/repo" for-each-ref --format='%(refname)' refs/deploy-history; }
+assert_contains "$(hist)" "refs/deploy-history/deploy/hub/"
+assert_eq "$(git -C "$T/repo" tag -l)" "" "(no tags at all in the clone)"
+assert_eq "$(git -C "$T/origin.git" for-each-ref)" "" "(nothing pushed)"
+assert_contains "$OUT" "DL_TAG_PUSH=local: a private ref, never pushed"
+ref=$(hist | head -n 1)
+assert_eq "$(git -C "$T/repo" rev-parse "$ref^{commit}")" "$SHA" "(the record points at the deployed commit)"
+assert_contains "$(git -C "$T/repo" cat-file -p "$ref")" "Deployed hub at $SHORT"
 echo fail >"$STUB_STATE/health"
+echo two >>"$T/repo/a.txt"; git -C "$T/repo" commit -qam two
 run_deploy DL_TAG_PUSH=local DL_HEALTH_TIMEOUT=0
-assert_contains "$(git -C "$T/repo" tag -l 'failed-deploy/hub/*')" "failed-deploy/hub/"
-assert_contains "$(git -C "$T/repo" tag -l 'rollback-point/hub/*')" "rollback-point/hub/"
-assert_eq "$(git -C "$T/origin.git" tag -l)" "" "(still nothing pushed)"
+assert_contains "$(hist)" "refs/deploy-history/failed-deploy/hub/"
+assert_contains "$(hist)" "refs/deploy-history/rollback-point/hub/"
+# How the public engines release: a push of main with --follow-tags, and
+# sometimes --tags. Neither may carry the deploy history along.
+git -C "$T/repo" push -q --follow-tags origin HEAD:refs/heads/main
+git -C "$T/repo" push -q --tags origin
+assert_eq "$(git -C "$T/origin.git" for-each-ref --format='%(refname)' | grep -v '^refs/heads/')" "" "(a release push published deploy history)"
 teardown
 
 setup "a PUBLIC GitHub remote refuses to push deploy tags, before anything changes"
@@ -984,6 +994,48 @@ assert_not_contains "$(cat "$STUB_STATE/calls")" "docker"
 rm "$STUB_STATE/gh_fail"; echo null >"$STUB_STATE/gh_private"
 run_deploy
 assert_eq "$RC" 3 "$OUT"
+teardown
+
+setup "the PUSH URL is what is checked: a private fetch URL with a public push URL is refused"
+git -C "$T/repo" config remote.origin.pushurl https://github.com/someone/public-app.git
+echo false >"$STUB_STATE/gh_private"
+run_deploy
+assert_eq "$RC" 3 "$OUT"
+assert_contains "$OUT" "someone/public-app is PUBLIC"
+git -C "$T/repo" config --unset remote.origin.pushurl
+git -C "$T/repo" config --add remote.origin.pushurl "$T/origin.git"
+git -C "$T/repo" config --add remote.origin.pushurl https://github.com/someone/public-app.git
+run_deploy
+assert_eq "$RC" 3 "(every push URL counts, not just the first) $OUT"
+teardown
+
+setup "--health makes no tags, so it never asks gh"
+git -C "$T/repo" remote set-url origin https://github.com/someone/public-app.git
+echo false >"$STUB_STATE/gh_private"
+cat >"$T/repo/h.conf" <<EOF
+DL_SERVICE=hub
+DL_COMPOSE_DIR='$T/compose'
+DL_HEALTH_URL=http://box/health
+DL_HEALTH_REQUIRE=.ok
+DL_STATE_DIR='$T/boxstate'
+EOF
+git -C "$T/repo" add h.conf; git -C "$T/repo" commit -qm h
+: >"$STUB_STATE/calls"
+OUT=$(PATH="$HERE/stubs:$PATH" bash "$HERE/../../deploy/homelab-deploy" "$T/repo/h.conf" --health 2>&1); RC=$?
+assert_eq "$RC" 0 "$OUT"
+assert_not_contains "$(cat "$STUB_STATE/calls")" "gh api"
+teardown
+
+setup "one failed probe of the running version does not lower the rollback bar"
+printf 'fail\nok {"ok":true}\n' >"$STUB_STATE/health_pre"
+echo 'ok {"ok":false}' >"$STUB_STATE/health"
+run_deploy DL_LIVENESS_URL=http://box/live DL_HEALTH_TIMEOUT=0 DL_TAG_PUSH=0
+assert_contains "$OUT" "passes the full health gate, so a rollback must pass it again"
+assert_eq "$RC" 5 "(held to the full gate it passed on the second try) $OUT"
+printf 'fail\nfail\nfail\nok {"ok":true}\n' >"$STUB_STATE/health_pre"; rm -f "$STUB_STATE/pre_count"
+run_deploy DL_LIVENESS_URL=http://box/live DL_HEALTH_TIMEOUT=0 DL_TAG_PUSH=0
+assert_contains "$OUT" "does not pass the health gate (3 tries)"
+assert_eq "$RC" 1 "(three failures: judged by liveness) $OUT"
 teardown
 
 setup "another host must be declared private; a bad DL_TAG_PUSH is a config error"

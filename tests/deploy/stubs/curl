@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Fake curl.
-# The health URL: the deploy's pre-restart probe (DL_PROBE=pre) reads
-# $STUB_STATE/health_pre if present, else fails. Every other call consumes the
+# The health URL: the deploy's pre-restart probes (DL_PROBE=pre) consume the
+# lines of $STUB_STATE/health_pre (the last repeats), and fail if it is absent. Every other call consumes the
 # next line of $STUB_STATE/health ("ok <body>" or "fail"); the last line repeats.
 # A URL ending in /live is the liveness URL: pre probes read live_pre, every
 # other call the next line of live; both default to "ok {}" when absent.
@@ -23,7 +23,7 @@ if [[ "$url" == */live ]]; then
     line=$(next_line "$S/live" "$S/live_count" 'ok {}')
   fi
 elif [[ "${DL_PROBE:-}" == pre ]]; then
-  line=$(cat "$S/health_pre" 2>/dev/null || echo fail)
+  line=$(next_line "$S/health_pre" "$S/pre_count" fail)
 else
   line=$(next_line "$S/health" "$S/curl_count" fail)
 fi
