@@ -37,7 +37,7 @@ chain_target() {
   else
     dir=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) \
       || dir=$(git rev-parse --git-common-dir 2>/dev/null) \
-      || { echo "ci-policy: could not find this repo's git dir; its own $hook hook did not run" >&2; return 0; }
+      || return 0  # no git dir yet (git init, clone): no repo hook can exist
     case "$dir" in /*) ;; *) dir="$PWD/$dir" ;; esac
     dir="$dir/hooks"
   fi
