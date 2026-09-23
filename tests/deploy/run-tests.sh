@@ -18,7 +18,7 @@ assert_not_contains() { [[ "$1" != *"$2"* ]] && ok || fail "did not expect '$2' 
 setup() {
   CURRENT="$1"
   T=$(mktemp -d)
-  export STUB_STATE="$T/state"; mkdir -p "$STUB_STATE"/{images,ps,inspect,tags}
+  export STUB_STATE="$T/state"; mkdir -p "$STUB_STATE"/{images,ps,inspect,tags,deps}
   : >"$STUB_STATE/calls"
   mkdir -p "$T/compose"
   git init -q --bare "$T/origin.git"
@@ -709,8 +709,9 @@ echo sha256:DBID >"$STUB_STATE/tags/timescale_timescaledb_2.29.1-pg16"
 # The trap is real: the old way reads the db image first.
 first=$(PATH="$HERE/stubs:$PATH" docker compose config --images web | head -n 1)
 assert_eq "$first" "timescale/timescaledb:2.29.1-pg16" "(stub lists the dependency first)"
+: >"$STUB_STATE/calls"
 printf 'fail\nok {"ok":true}\n' >"$STUB_STATE/health"
-run_deploy DL_SERVICES="poller web" DL_HEALTH_TIMEOUT=0 DL_TAG_PUSH=0
+run_deploy "DL_SERVICES='poller web'" DL_HEALTH_TIMEOUT=0 DL_TAG_PUSH=0
 assert_eq "$RC" 1 "$OUT"
 assert_contains "$OUT" "rollback point: web runs house-climate-web:$PRE"
 assert_contains "$OUT" "rollback point: poller runs house-climate-poller:$PRE"
