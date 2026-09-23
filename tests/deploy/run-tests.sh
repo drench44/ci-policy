@@ -181,7 +181,8 @@ setup "DL_SERVICES limits the deploy"
 printf 'web\ndb\n' >"$STUB_STATE/services"
 run_deploy DL_SERVICES=web DL_TAG_PUSH=0
 assert_contains "$CALLS" "docker compose up -d --build web"
-assert_not_contains "$CALLS" "config --images db"
+assert_not_contains "$CALLS" "--format json db"
+assert_contains "$CALLS" "--format json web"
 teardown
 
 setup "remote deploy runs docker over ssh with ~ kept expandable"
