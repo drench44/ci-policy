@@ -90,6 +90,17 @@ class MainWatchWiringTests(unittest.TestCase):
 
 
 class AuditWiringTests(unittest.TestCase):
+    def test_every_audit_input_is_one_the_script_reads(self):
+        # A typo in an INPUT_ name would quietly fall back to the default.
+        text = read(os.path.join(ROOT, ".github", "workflows", "main-watch-audit.yml"))
+        src = read(os.path.join(ROOT, "lib", "ci_policy", "main_watch_audit.py"))
+        envs = re.findall(r"^\s+INPUT_([A-Z_]+):", text, re.M)
+        self.assertIn("AUDIT_TOKEN", envs)
+        for env in envs:
+            name = env.lower().replace("_", "-")
+            with self.subTest(input=name):
+                self.assertIn(f'env_input("{name}"', src)
+
     def test_audit_runs_hosted_on_a_schedule_with_the_secret(self):
         text = read(os.path.join(ROOT, ".github", "workflows", "main-watch-audit.yml"))
         self.assertIn("runs-on: ubuntu-latest", text)

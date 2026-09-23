@@ -465,13 +465,8 @@ class Watcher:
         bad: List[str] = []
         waiting: List[str] = []
         good = 0
-        seen: Dict[str, str] = {}   # check name -> worst state among runs of that name
+        reported: Set[str] = set()   # check names and status contexts present on the head
         suites_with_runs: Set[Any] = set()
-
-        def note(name: str, state: str) -> None:
-            rank = {GREEN: 0, PENDING: 1, RED: 2}
-            if name not in seen or rank[state] > rank[seen[name]]:
-                seen[name] = state
 
         # `filter=latest` only drops older attempts inside one check suite, and
         # every workflow run is its own suite: a pr-policy run that failed and
@@ -500,12 +495,12 @@ class Watcher:
                 continue
             if r.get("status") != "completed":
                 waiting.append(f"{name} is {r.get('status') or 'not started'}")
-                note(name, PENDING)
+                reported.add(name)
             elif r.get("conclusion") not in OK_CONCLUSIONS:
                 bad.append(f"{name} {r.get('conclusion')}")
-                note(name, RED)
+                reported.add(name)
             else:
-                note(name, GREEN)
+                reported.add(name)
                 if r.get("conclusion") == "success" and not POLICY_JOB.search(name):
                     # Skipped and neutral are not failures, but they prove nothing:
                     # a PR whose only job was skipped did not pass anything.
@@ -556,16 +551,16 @@ class Watcher:
             state = s.get("state")
             if state == "success":
                 good += 1
-                note(name, GREEN)
+                reported.add(name)
             elif state == "pending":
                 waiting.append(f"{name} is pending")
-                note(name, PENDING)
+                reported.add(name)
             else:
                 bad.append(f"{name} {state}")
-                note(name, RED)
+                reported.add(name)
 
         for name in self.cfg.required_checks:
-            if name not in seen:
+            if name not in reported:
                 waiting.append(f"required check `{name}` has not reported")
 
         if bad:
@@ -856,6 +851,12 @@ def main() -> int:
         # on the new tip.
         marks.append(Verdict(Commit(after, "", None, "", ""), FLAG,
                              _shown(plan.alerts, 1)))
+    if alert_result and alert_result.startswith("FAILED"):
+        # No issue means nobody was told. A final failure status would tell the
+        # audit it was handled, so the flagged commits stay pending instead:
+        # the scheduled re-check judges them again and retries the issue.
+        marks = [Verdict(v.commit, WAIT, v.reason, v.pr) if v.state == FLAG else v
+                 for v in marks]
     if cfg.set_status and marks:
         # The status is how the out-of-band audit knows main-watch concluded.
         # Written after the issue, so a flagged commit is never marked before

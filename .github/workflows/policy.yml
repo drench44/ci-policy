@@ -7,7 +7,7 @@ on:
     branches: [main]
   # main-watch's re-check of commits whose PR checks were still running at merge.
   schedule:
-    - cron: "41 * * * *"
+    - cron: 41 * * * *
   workflow_dispatch:
 
 permissions:

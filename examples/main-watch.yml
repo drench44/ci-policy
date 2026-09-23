@@ -5,7 +5,7 @@ on:
     branches: [main]   # [master] for fleet-dashboard
   # Re-check commits whose PR checks were still running when the PR was merged.
   schedule:
-    - cron: "41 * * * *"
+    - cron: 41 * * * *
   workflow_dispatch:
 permissions:
   contents: read

@@ -148,6 +148,18 @@ class AuditRepoTests(unittest.TestCase):
         self.assertEqual(p.key, "drench44/demo:read")
         self.assertIn("Commit statuses", p.text)
 
+    def test_compare_server_error_is_a_problem_not_a_pass(self):
+        routes = {f"GET {R}/activity": [push(S1, 7)],
+                  f"GET {R}/commits/{S1}/status": mark("success"),
+                  f"GET {R}/compare/{'0' * 39 + '9'}...{S1}": gh.GitHubError("down", 502)}
+        (p,) = self.run_audit(routes).problems
+        self.assertEqual(p.key, f"drench44/demo@{S1}:error")
+
+    def test_long_lookback_asks_for_a_month(self):
+        api = FakeGitHub({f"GET {R}/activity": []})
+        audit_repo(api, W, NOW, 6, 24 * 10)
+        self.assertEqual(api.calls[0][2]["time_period"], "month")
+
     def test_activity_query(self):
         api = FakeGitHub({f"GET {R}/activity": []})
         audit_repo(api, W, NOW, 6, 72)
@@ -197,12 +209,14 @@ HOME = "/repos/drench44/ci-policy"
 
 
 class AuditMainTests(unittest.TestCase):
-    def run_main(self, audit_routes, home_routes, inputs=None, token="pat"):
+    def run_main(self, audit_routes, home_routes, inputs=None, token="pat", expiry=None):
         repos = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
         json.dump({"repos": {"drench44/demo": {"branch": "main"}}}, repos)
         repos.close()
         home = FakeGitHub(home_routes)
         pat = FakeGitHub({"GET /rate_limit": {}, **audit_routes})
+        if expiry:
+            pat.headers["/rate_limit"] = {"github-authentication-token-expiration": expiry}
         ins = {"repos-file": repos.name, **(inputs or {})}
         if token:
             ins["audit-token"] = token
@@ -281,6 +295,36 @@ class AuditMainTests(unittest.TestCase):
             f"GET {HOME}/issues/9/comments": []})
         self.assertEqual(code, 0)
         self.assertEqual(home.posts, [])
+
+    def test_key_reported_in_a_comment_stays_quiet(self):
+        # After the first issue every alert is a comment; keys live there too.
+        issue = {"number": 9, "state": "open", "body": "<!-- main-watch-audit keys: other -->"}
+        code, summary, home = self.run_main(self.STUCK, {
+            f"GET {HOME}/issues": [issue], f"GET {HOME}/issues/9/comments": [
+                {"body": f"<!-- main-watch-audit keys: drench44/demo@{S1} -->"}]})
+        self.assertEqual(code, 0)
+        self.assertEqual(home.posts, [])
+        self.assertIn("already reported", summary)
+
+    def test_newest_open_issue_gets_the_comment(self):
+        newer = {"number": 12, "state": "open", "body": ""}
+        older = {"number": 9, "state": "open", "body": ""}
+        code, _, home = self.run_main(self.STUCK, {
+            f"GET {HOME}/issues": [newer, older], f"GET {HOME}/issues/12/comments": [],
+            f"GET {HOME}/issues/9/comments": [], f"POST {HOME}/issues/12/comments": {}})
+        self.assertEqual(code, 0)
+        self.assertEqual(home.posts[0][0], f"{HOME}/issues/12/comments")
+
+    def test_expiring_token_still_audits_and_warns(self):
+        routes = dict(self.STUCK)
+        code, summary, home = self.run_main(routes, {
+            f"GET {HOME}/issues": [], f"POST {HOME}/labels": {},
+            f"POST {HOME}/issues": {"number": 1}},
+            expiry="2026-09-30 00:00:00 UTC")
+        self.assertEqual(code, 0, summary)
+        body = home.posts[-1][1]["body"]
+        self.assertIn("token:expires:2026-09-30", body)
+        self.assertIn(f"drench44/demo@{S1}", body)
 
     def test_new_problem_comments_on_the_open_issue(self):
         issue = {"number": 9, "state": "open", "body": "<!-- main-watch-audit keys: old -->"}

@@ -96,7 +96,8 @@ runner the queued check needs.
 
 **Commit status.** Every commit main-watch judges gets a
 `ci-policy/main-watch` status: success, failure or pending, linking to the
-run. The audit below uses it to tell "judged" from "never ran". Callers must
+run. A flagged commit whose alert issue could not be opened stays pending, so
+the re-check judges it again and retries the issue (and the run is red). The audit below uses it to tell "judged" from "never ran". Callers must
 grant `statuses: write` and `actions: read` (the reusable workflow asks for
 them, and a called workflow cannot get more than its caller grants).
 
