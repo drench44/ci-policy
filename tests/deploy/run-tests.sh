@@ -2,6 +2,7 @@
 # Tests for deploy/deploy-lib.sh. Plain bash, no bats needed.
 # docker, curl, and ssh are stubs (tests/deploy/stubs); git is real, against
 # a throwaway repo with a bare "origin", so tag creation and push are real.
+# shellcheck disable=SC2034  # DL_* settings are read by the sourced library
 set -u
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LIB="$HERE/../../deploy/deploy-lib.sh"
@@ -103,7 +104,8 @@ echo fail >"$STUB_STATE/health"
 run_deploy DL_HEALTH_TIMEOUT=0
 assert_eq "$RC" 2
 assert_contains "$OUT" "SERVICE IS DOWN"
-assert_contains "$OUT" "cd $T/compose && docker tag hub-web:pre-$SHORT hub-web:latest"
+assert_contains "$OUT" "cd $T/compose && tar -xzf $T/boxstate/snapshot-"
+assert_contains "$OUT" "docker tag hub-web:pre-$SHORT hub-web:latest && docker compose up"
 teardown
 
 setup "compose up failure rolls back"
@@ -126,7 +128,7 @@ setup "first deploy with nothing running still succeeds"
 rm "$STUB_STATE/ps/web"
 run_deploy
 assert_eq "$RC" 0
-assert_contains "$OUT" "(no rollback point was recorded)"
+assert_contains "$OUT" "(no image rollback point was recorded)"
 teardown
 
 setup "re-running the same commit keeps the earlier rollback point"
@@ -175,7 +177,8 @@ mkdir -p "$T/home/svc dir"
 run_deploy DL_REMOTE=box "HOME='$T/home'" "DL_COMPOSE_DIR='~/svc dir'" DL_TAG_PUSH=0
 assert_eq "$RC" 0
 assert_contains "$CALLS" 'ssh box cd ~/svc\ dir && docker compose up -d --build'
-assert_contains "$OUT" "ssh box 'cd ~/svc dir && docker tag"
+assert_contains "$OUT" "ssh box 'cd ~/svc dir && tar -xzf"
+assert_contains "$OUT" "docker tag hub-web:pre-"
 teardown
 
 setup "remote health check curls on the box"
@@ -365,7 +368,7 @@ teardown
 
 setup "snapshot excludes and keep count"
 mkdir -p "$T/compose/data"; echo big >"$T/compose/data/blob"; echo c >"$T/compose/c.yml"
-for i in 1 2 3; do
+for _ in 1 2 3; do
   run_deploy "DL_SNAPSHOT_EXCLUDE='./data'" DL_SNAPSHOT_KEEP=2 DL_TAG_PUSH=0
   sleep 1
 done

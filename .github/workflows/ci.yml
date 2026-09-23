@@ -1,0 +1,57 @@
+name: ci
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    # Public repo: hosted runners are free. macOS matters: the Mac runs the
+    # git hooks and deploys with its stock bash 3.2 and BSD tools.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tool versions
+        run: |
+          bash --version | head -n 1
+          git --version
+          python3 --version
+          jq --version
+      - name: Python unit tests (pr-policy, main-watch, allowlist, local hooks)
+        working-directory: tests
+        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s . -v
+      - name: Deploy library tests (under /bin/bash on macOS, i.e. bash 3.2)
+        run: /bin/bash tests/deploy/run-tests.sh
+      - name: Git hook tests (installer, dispatcher, policy, chaining)
+        run: /bin/bash tests/git-hooks/run-tests.sh
+
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        run: |
+          shellcheck git-hooks/dispatch install/install-git-hooks.sh deploy/deploy-lib.sh \
+            tests/deploy/stubs/*
+          shellcheck -x -P SCRIPTDIR deploy/homelab-deploy tests/deploy/run-tests.sh \
+            tests/git-hooks/run-tests.sh
+      - name: actionlint
+        uses: docker://rhysd/actionlint:1.7.7
+        with:
+          args: -color
+      - name: No em dashes anywhere in the repo
+        run: |
+          if git grep -n "$(printf '\342\200\224')" -- . ; then
+            echo "::error::em dash found (house rule)"; exit 1
+          fi
+      - name: Allowlist is valid JSON with valid rules
+        run: PYTHONPATH=lib python3 -c "from ci_policy import allowlist; r = allowlist.load('policy/main-allowlist.json'); print(sum(map(len, r.values())), 'rules for', len(r), 'repos')"

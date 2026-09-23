@@ -89,7 +89,7 @@ INCLUDE_FILE="$PREFIX/gitconfig"
 # Every git repo (main checkouts only; worktrees share their main repo's config).
 find_repos() {
   local root
-  for root in "${SCANS[@]}"; do
+  for root in ${SCANS[@]+"${SCANS[@]}"}; do
     [[ -d "$root" ]] || continue
     find "$root" -maxdepth 3 -type d \( -name node_modules -o -name .venv \) -prune \
       -o -type d -name .git -print 2>/dev/null | sed 's|/\.git$||'
