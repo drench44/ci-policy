@@ -60,9 +60,16 @@ branch through a merged PR whose head commit was all green:
   PR's gate and are left out, as is main-watch's own status. Apps that
   register a check suite and never report (the Claude app does this on every
   PR) are ignored.
-- At least one check passed (skipped-only proves nothing), when the repo has
-  any active workflow besides main-watch (`require-checks: auto`, the
-  default; `true` or `false` to force it).
+- Only the newest run of each check counts, per workflow file (like GitHub's
+  required checks): a pr-policy run that failed and was re-run green after
+  the body was fixed is green. Without `actions: read` main-watch cannot tell
+  workflows apart, warns, and judges every run on its own (strict).
+- At least one of the PR's own checks passed (skipped-only proves nothing;
+  the shared `pr-policy` and `main-watch` jobs must be green but do not
+  count, since they run on every PR), when the repo has any active workflow
+  besides main-watch (`require-checks: auto`, the default; `true` or `false`
+  to force it). The newest run of a workflow that was cancelled before any
+  job ran is not green.
 - Every name in the optional `required-checks` input (one exact check run
   name or status context per line, for example `Vitest (full suite)`) is
   present and green. A missing required check is not green.
@@ -80,7 +87,8 @@ reverts anything.
 waiting (cpapclarity's sitestats and articlewatch) can merge a PR while its
 Vitest job is still queued. That is not a failure yet, so main-watch waits:
 the commit gets a pending status, and the caller's hourly scheduled run
-re-reads the checks of every commit still pending. Green turns the status
+reads the branch's 50 newest commits and re-reads the checks of every one
+still pending. Green turns the status
 green; a failure, or checks still not done `pending-timeout-minutes` (default
 180) after the merge, flags it like any other. It does not wait inside the
 job: on a private repo the job holds the repo's only OMEN runner, the very
@@ -102,11 +110,15 @@ because this repo is public) and, for every repo in
 `policy/main-watch-repos.json`, lists the pushes to the watched branch from
 the last 72 hours (the repository activity API). Each push tip older than 6
 hours must carry a final `ci-policy/main-watch` status, or (for callers still
-pinned to a main-watch that set none) a completed main-watch run. A status
+pinned to a main-watch that set none) a successful main-watch run. A commit
+inside a push (not its tip) still marked pending is reported too. A status
 still pending after 6 hours means the scheduled re-check is not running
 either. Problems open one issue here labeled `main-watch-audit` (GitHub emails
-it), or comment on the open one. Each problem is reported once; closing the
-issue acknowledges what it listed. A deleted branch is reported too.
+it), or comment on the open one. A problem with one push is reported once;
+closing the issue acknowledges it. A standing condition (a repo the token
+cannot read, a missing or expiring token) is reported again whenever no audit
+issue is open, and any repo the token cannot read turns the run red. A
+deleted branch is reported too.
 
 It reads the other repos with a fine-grained personal access token in the
 secret `MAIN_WATCH_AUDIT_TOKEN`: resource owner drench44, only the watched
@@ -119,8 +131,9 @@ token expires.
 
 The audit's own death: GitHub disables scheduled workflows in a public repo
 after 60 days without a commit. garage's fleet-watch (on the other homelab box, not
-the OMEN) checks through the public API that this workflow is enabled and
-ran within the last 3 hours.
+the OMEN) checks through the public API that this workflow is enabled,
+started a run within the last 3 hours, and that its newest finished run
+succeeded.
 
 Add a repo to `policy/main-watch-repos.json` in the same change that gives it
 a main-watch caller.

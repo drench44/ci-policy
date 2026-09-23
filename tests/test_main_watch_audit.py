@@ -77,14 +77,48 @@ class AuditRepoTests(unittest.TestCase):
                                                     "success", "path": ".github/workflows/ci.yml"})}
         self.assertEqual(len(self.run_audit(routes).problems), 1)
 
-    def test_completed_legacy_run_without_status_is_accepted(self):
+    def test_successful_legacy_run_without_status_is_accepted(self):
         # Callers still pinned to a main-watch that set no status.
         routes = {f"GET {R}/activity": [push(S1, 7)],
                   f"GET {R}/commits/{S1}/status": {"statuses": []},
                   f"GET {R}/actions/runs": wf_runs(
-                      {"status": "completed", "conclusion": "cancelled", "run_attempt": 1},
-                      {"status": "completed", "conclusion": "failure", "run_attempt": 2})}
+                      {"status": "completed", "conclusion": "cancelled"},
+                      {"status": "completed", "conclusion": "success", "run_attempt": 2})}
         self.assertEqual(self.run_audit(routes).problems, [])
+
+    def test_failed_run_without_status_is_not_proof(self):
+        # A job killed by its timeout leaves a failed run and no status.
+        routes = {f"GET {R}/activity": [push(S1, 7)],
+                  f"GET {R}/commits/{S1}/status": {"statuses": []},
+                  f"GET {R}/actions/runs": wf_runs({"status": "completed",
+                                                    "conclusion": "failure"})}
+        (p,) = self.run_audit(routes).problems
+        self.assertIn("ended failure and left no status", p.text)
+
+    def test_pending_commit_inside_a_push_is_found(self):
+        routes = {f"GET {R}/activity": [push(S1, 7)],
+                  f"GET {R}/commits/{S1}/status": mark("success"),
+                  f"GET {R}/compare/{'0' * 39 + '9'}...{S1}": {"commits": [
+                      {"sha": S3}, {"sha": S2}, {"sha": S1}]},
+                  f"GET {R}/commits/{S3}/status": mark("success"),
+                  f"GET {R}/commits/{S2}/status": mark("pending", "PR #4: waiting")}
+        (p,) = self.run_audit(routes).problems
+        self.assertEqual(p.key, f"drench44/demo@{S2}")
+        self.assertIn("part of push", p.text)
+
+    def test_one_unreadable_push_does_not_hide_the_others(self):
+        routes = {f"GET {R}/activity": [push(S1, 7), push(S2, 8)],
+                  f"GET {R}/commits/{S1}/status": gh.GitHubError("No commit found", 422),
+                  f"GET {R}/commits/{S2}/status": {"statuses": []},
+                  f"GET {R}/actions/runs": wf_runs()}
+        keys = sorted(p.key for p in self.run_audit(routes).problems)
+        self.assertEqual(keys, [f"drench44/demo@{S1}:error", f"drench44/demo@{S2}"])
+
+    def test_deletion_without_an_id_keys_on_its_time(self):
+        a = push("0" * 40, 7, kind="branch_deletion")
+        a.pop("id")
+        (p,) = self.run_audit({f"GET {R}/activity": [a]}).problems
+        self.assertEqual(p.key, f"drench44/demo@deleted@{a['timestamp']}")
 
     def test_pending_past_grace_means_the_recheck_is_not_running(self):
         routes = {f"GET {R}/activity": [push(S1, 8)],
@@ -217,6 +251,36 @@ class AuditMainTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(home.posts, [])
         self.assertIn("already reported", summary)
+
+    def test_standing_condition_alerts_again_once_its_issue_is_closed(self):
+        # The token still cannot read the repo: closing the issue must not
+        # silence that forever.
+        issue = {"number": 9, "state": "closed",
+                 "body": "x <!-- main-watch-audit keys: drench44/demo:read -->"}
+        code, _, home = self.run_main({f"GET {R}/activity": gh.GitHubError("nope", 404)}, {
+            f"GET {HOME}/issues": [issue], f"GET {HOME}/issues/9/comments": [],
+            f"POST {HOME}/labels": {}, f"POST {HOME}/issues": {"number": 10}})
+        self.assertEqual(code, 1)
+        self.assertIn("drench44/demo:read", home.posts[-1][1]["body"])
+
+    def test_standing_condition_in_the_open_issue_stays_quiet(self):
+        issue = {"number": 9, "state": "open",
+                 "body": "x <!-- main-watch-audit keys: drench44/demo:read -->"}
+        code, summary, home = self.run_main({f"GET {R}/activity": gh.GitHubError("nope", 404)},
+                                            {f"GET {HOME}/issues": [issue],
+                                             f"GET {HOME}/issues/9/comments": []})
+        self.assertEqual(code, 1)
+        self.assertEqual(home.posts, [])
+
+    def test_push_reported_in_an_older_closed_issue_stays_quiet(self):
+        newer = {"number": 12, "state": "open", "body": "<!-- main-watch-audit keys: other -->"}
+        older = {"number": 9, "state": "closed",
+                 "body": f"<!-- main-watch-audit keys: drench44/demo@{S1} -->"}
+        code, _, home = self.run_main(self.STUCK, {
+            f"GET {HOME}/issues": [newer, older], f"GET {HOME}/issues/12/comments": [],
+            f"GET {HOME}/issues/9/comments": []})
+        self.assertEqual(code, 0)
+        self.assertEqual(home.posts, [])
 
     def test_new_problem_comments_on_the_open_issue(self):
         issue = {"number": 9, "state": "open", "body": "<!-- main-watch-audit keys: old -->"}

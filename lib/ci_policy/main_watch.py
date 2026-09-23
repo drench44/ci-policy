@@ -49,6 +49,12 @@ PASS, FLAG, WAIT = "pass", "flag", "pending"
 GREEN, RED, PENDING = "green", "red", "pending"
 STATUS_STATE = {PASS: "success", FLAG: "failure", WAIT: "pending"}
 PR_REF = re.compile(r"^PR #(\d+)\b")
+# The shared policy jobs (`<caller job> / pr-policy`, `... / main-watch`) run on
+# every PR whatever the change, so they must be green but do not count as the
+# "at least one check passed" the PR's own CI has to provide.
+POLICY_JOB = re.compile(r"(^|/ )(pr-policy|main-watch)$")
+# How many of the branch's newest commits the scheduled re-check reads.
+RECHECK_COMMITS = 50
 MAX_STACK_DEPTH = 4
 
 
@@ -426,17 +432,20 @@ class Watcher:
                 self._pr_checks[number] = self.head_checks(head, parse_time(pr.get("merged_at")))
         return self._pr_checks[number]
 
-    def workflow_paths(self, sha: str) -> Dict[Any, str]:
-        """check suite id -> workflow file, for the Actions runs on this commit."""
+    def workflow_paths(self, sha: str) -> Optional[Dict[Any, str]]:
+        """check suite id -> workflow file for the Actions runs on this commit, or
+        None when the Actions API cannot be read."""
         try:
             runs = self.api.paginate(f"/repos/{self.repo}/actions/runs", {"head_sha": sha},
                                      item_key="workflow_runs")
         except gh.GitHubError as e:
             if e.status not in (403, 404):
                 raise
-            # Without `actions: read`, fall back to GitHub's own rule: newest
-            # run per check name.
-            return {}
+            gh.annotate("warning", f"could not list the Actions runs on {sha[:7]} ({e}); "
+                        "grant `actions: read`. Judging every check suite on its own, so a "
+                        "failed run that was re-run green still counts as failed.",
+                        "main-watch")
+            return None
         return {w["check_suite_id"]: w.get("path") or "" for w in runs
                 if w.get("check_suite_id")}
 
@@ -449,7 +458,8 @@ class Watcher:
         post_merge = {s.get("id") for s in suites if s.get("head_branch") == self.branch}
         runs = self.api.paginate(f"/repos/{self.repo}/commits/{sha}/check-runs",
                                  {"filter": "latest"}, item_key="check_runs")
-        suite_path = self.workflow_paths(sha)
+        paths = self.workflow_paths(sha)
+        suite_path: Dict[Any, str] = paths or {}
         run_marker = f"/actions/runs/{self.cfg.run_id}/" if self.cfg.run_id else None
         required = set(self.cfg.required_checks)
         bad: List[str] = []
@@ -476,8 +486,11 @@ class Watcher:
             if run_marker and run_marker in (r.get("details_url") or ""):
                 continue
             suites_with_runs.add(suite)
-            key = ((r.get("app") or {}).get("slug") or "", suite_path.get(suite, ""),
-                   r.get("name") or "?")
+            # Unknown workflow (no Actions API, or another app): group by
+            # suite when the API failed (strict: an old red run stays red), by
+            # app and name otherwise.
+            where = suite_path.get(suite) or ("" if paths is not None else f"suite:{suite}")
+            key = ((r.get("app") or {}).get("slug") or "", where, r.get("name") or "?")
             if key not in newest or (r.get("id") or 0) > (newest[key].get("id") or 0):
                 newest[key] = r
 
@@ -493,7 +506,7 @@ class Watcher:
                 note(name, RED)
             else:
                 note(name, GREEN)
-                if r.get("conclusion") == "success":
+                if r.get("conclusion") == "success" and not POLICY_JOB.search(name):
                     # Skipped and neutral are not failures, but they prove nothing:
                     # a PR whose only job was skipped did not pass anything.
                     good += 1
@@ -501,6 +514,8 @@ class Watcher:
         newest_suite: Dict[str, Any] = {}
         for s in suites:
             path = suite_path.get(s.get("id"))
+            if s.get("id") in post_merge:
+                continue
             if path and (s.get("id") or 0) > (newest_suite.get(path) or 0):
                 newest_suite[path] = s.get("id")
         for s in suites:
@@ -514,6 +529,10 @@ class Watcher:
                 if s.get("conclusion") in BAD_EMPTY_SUITE:
                     bad.append(f"{app} check suite {s.get('conclusion')} before any check ran "
                                "(a workflow that could not start?)")
+                elif path and s.get("conclusion") in ("cancelled", "stale"):
+                    # The newest run of this workflow on the head, and it never
+                    # ran a job: nothing re-ran it, so the workflow did not pass.
+                    bad.append(f"{path} was {s.get('conclusion')} before any check ran")
             elif app == "github-actions":
                 # A workflow run that has not created its first job yet.
                 waiting.append("a GitHub Actions workflow has not started its jobs yet")
@@ -607,19 +626,14 @@ def own_status(api: gh.GitHub, repo: str, sha: str) -> Optional[Dict[str, Any]]:
 # ------------------------------------------------------------- re-check
 
 def recheck(api: gh.GitHub, repo: str, branch: str, watcher: Watcher,
-            lookback_hours: int = 24) -> Tuple[List[Verdict], List[str]]:
+            limit: int = RECHECK_COMMITS) -> Tuple[List[Verdict], List[str]]:
     """Re-judge the commits a push run left pending.
 
-    Looks at the branch's commits from the last ``pending-timeout`` plus
-    ``lookback_hours``, and re-reads the checks of each commit whose
-    main-watch status is still pending.
+    Reads the branch's ``limit`` newest commits (by position, not date: a
+    commit inside a merged PR keeps its old committer date) and re-reads the
+    checks of each whose main-watch status is still pending.
     """
-    cfg = watcher.cfg
-    since = cfg.now() - dt.timedelta(minutes=cfg.pending_timeout_minutes,
-                                     hours=lookback_hours)
-    commits = api.paginate(f"/repos/{repo}/commits",
-                           {"sha": branch, "since": since.strftime("%Y-%m-%dT%H:%M:%SZ")},
-                           limit=500)
+    commits = api.get(f"/repos/{repo}/commits", {"sha": branch, "per_page": limit}) or []
     notes: List[str] = []
     verdicts: List[Verdict] = []
     for raw in commits:
@@ -635,7 +649,7 @@ def recheck(api: gh.GitHub, repo: str, branch: str, watcher: Watcher,
                 continue
         verdicts.append(watcher.verdict(commit))
     if not verdicts:
-        notes.append(f"No commit on `{branch}` since {since:%Y-%m-%d %H:%M} UTC is waiting "
+        notes.append(f"None of the {len(commits)} newest commits on `{branch}` is waiting "
                      "on checks.")
     return verdicts, notes
 
@@ -775,13 +789,14 @@ def main() -> int:
         ref = event.get("ref") or os.environ.get("GITHUB_REF", "")
         if not recheck_mode and ref != f"refs/heads/{branch}":
             protected_elsewhere = ref in ("refs/heads/main", "refs/heads/master")
-            gh.annotate("warning" if protected_elsewhere else "notice",
+            gh.annotate("error" if protected_elsewhere else "notice",
                         f"main-watch only watches {branch}; this push was to {ref}."
-                        + (" Check the workflow's `branch` input." if protected_elsewhere
-                           else ""), "main-watch")
+                        + (" Nothing was checked: fix the workflow's `branch` input."
+                           if protected_elsewhere else ""), "main-watch")
             gh.write_summary(f"## main-watch skipped\n\nThis push was to `{ref}`, "
                              f"not `{branch}`.\n")
-            return 0
+            # A push to main or master that nobody checked must not look green.
+            return 1 if protected_elsewhere else 0
         api = gh.GitHub(gh.env_input("token"),
                         os.environ.get("GITHUB_API_URL", "https://api.github.com"))
         watcher = Watcher(api, repo, branch, cfg)
@@ -834,11 +849,18 @@ def main() -> int:
             gh.annotate("error" if cfg.fail_on_alert else "warning", a, "main-watch")
     for v in waiting:
         gh.annotate("notice", f"{v.commit.short} {v.commit.subject}: {v.reason}", "main-watch")
-    if cfg.set_status and verdicts:
+    marks = list(verdicts)
+    after = str(event.get("after") or ZERO_SHA)
+    if plan.alerts and after != ZERO_SHA and all(v.commit.sha != after for v in verdicts):
+        # A rewind adds no commits, but the audit still looks for a conclusion
+        # on the new tip.
+        marks.append(Verdict(Commit(after, "", None, "", ""), FLAG,
+                             _shown(plan.alerts, 1)))
+    if cfg.set_status and marks:
         # The status is how the out-of-band audit knows main-watch concluded.
         # Written after the issue, so a flagged commit is never marked before
         # the alert exists.
-        errors = publish_statuses(api, repo, verdicts, cfg.target_url)
+        errors = publish_statuses(api, repo, marks, cfg.target_url)
         if errors:
             gh.annotate("error", "main-watch could not set its commit status (grant "
                         f"`statuses: write`): {_shown(errors, 3)}", "main-watch")

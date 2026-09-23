@@ -47,6 +47,10 @@ class Problem:
     key: str
     repo: str
     text: str
+    # True for a fact about one push (reported once; closing the issue
+    # acknowledges it). False for a standing condition (a repo the token cannot
+    # read, a missing token): reported again whenever no audit issue is open.
+    once: bool = True
 
 
 @dataclass
@@ -81,23 +85,70 @@ def _hours(delta: dt.timedelta) -> str:
 
 
 def run_state(api: gh.GitHub, w: Watched, sha: str) -> str:
-    """How the main-watch workflow run for this push ended, or why there is none."""
+    """For a push tip with no status: did a main-watch run judge it anyway?
+
+    Only a successful run counts. A main-watch that sets statuses always sets
+    one when it succeeds, so this only accepts callers still pinned to a
+    main-watch from before the status existed. A failed run without a status
+    is either an old one that flagged (its issue exists; reporting it again is
+    loud, not wrong) or a new one that died before judging.
+    """
     data = api.get(f"/repos/{w.repo}/actions/runs",
                    {"head_sha": sha, "event": "push", "per_page": 100}) or {}
     runs = [r for r in data.get("workflow_runs") or [] if r.get("path") == w.workflow]
     if not runs:
         return "no main-watch run exists for it"
-    latest = max(runs, key=lambda r: (r.get("run_attempt") or 0, r.get("id") or 0))
+    latest = max(runs, key=lambda r: (r.get("id") or 0, r.get("run_attempt") or 0))
     if latest.get("status") != "completed":
         return f"its main-watch run is still {latest.get('status')}"
-    # success, or failure (what a flag or a loud error produces). Anything
-    # else (cancelled, startup_failure when a caller grants too little,
-    # action_required, stale) means nothing was judged.
-    if latest.get("conclusion") not in ("success", "failure"):
+    if latest.get("conclusion") != "success":
         hint = (" (does the caller grant every permission the pinned main-watch asks for?)"
                 if latest.get("conclusion") == "startup_failure" else "")
-        return f"its main-watch run ended {latest.get('conclusion') or 'without a conclusion'}{hint}"
+        return (f"its main-watch run ended {latest.get('conclusion') or 'without a conclusion'}"
+                f" and left no status{hint}")
     return "concluded"
+
+
+def check_push(api: gh.GitHub, w: Watched, a: dict, age: dt.timedelta) -> List[Problem]:
+    after = a.get("after") or ZERO_SHA
+    kind = a.get("activity_type")
+    link = f"[{after[:7]}](https://github.com/{w.repo}/commit/{after})"
+    problems: List[Problem] = []
+    mark = own_status(api, w.repo, after)
+    state = (mark or {}).get("state")
+    if state == "pending":
+        problems.append(Problem(
+            f"{w.repo}@{after}", w.repo,
+            f"{link} ({kind}) is still marked pending {_hours(age)} after the push, so the "
+            f"scheduled re-check is not running: {(mark or {}).get('description') or ''}"))
+    elif state not in FINAL_STATES:
+        how = run_state(api, w, after)
+        if how != "concluded":
+            problems.append(Problem(
+                f"{w.repo}@{after}", w.repo,
+                f"{link} ({kind}) has no main-watch conclusion {_hours(age)} after the push: "
+                f"{how}"))
+    # A commit inside the push (not its tip) left pending is invisible above.
+    before = a.get("before") or ZERO_SHA
+    if before != ZERO_SHA:
+        try:
+            cmp = api.get(f"/repos/{w.repo}/compare/{before}...{after}", {"per_page": 100})
+        except gh.GitHubError as e:
+            if e.status not in (404, 422):
+                raise
+            cmp = {}   # the old tip is gone (force push); main-watch flagged that itself
+        for c in cmp.get("commits") or []:
+            sha = c.get("sha")
+            if not sha or sha == after:
+                continue
+            inner = own_status(api, w.repo, sha)
+            if (inner or {}).get("state") == "pending":
+                problems.append(Problem(
+                    f"{w.repo}@{sha}", w.repo,
+                    f"[{sha[:7]}](https://github.com/{w.repo}/commit/{sha}), part of push "
+                    f"{link}, is still marked pending {_hours(age)} after the push, so the "
+                    f"scheduled re-check is not running: {inner.get('description') or ''}"))
+    return problems
 
 
 def audit_repo(api: gh.GitHub, w: Watched, now: dt.datetime, grace_hours: float,
@@ -110,47 +161,36 @@ def audit_repo(api: gh.GitHub, w: Watched, now: dt.datetime, grace_hours: float,
                                 {"ref": f"refs/heads/{w.branch}",
                                  "time_period": "week" if lookback_hours <= 24 * 7 else "month"},
                                 limit=1000)
-        seen: Set[str] = set()
-        for a in activity:
-            ts = parse_time(a.get("timestamp"))
-            if ts is None or ts < oldest or ts > newest:
-                continue
-            age = now - ts
-            after = a.get("after") or ZERO_SHA
-            if a.get("activity_type") == "branch_deletion" or after == ZERO_SHA:
-                report.problems.append(Problem(
-                    f"{w.repo}@deleted@{a.get('id')}", w.repo,
-                    f"`{w.branch}` was deleted {_hours(age)} ago"))
-                continue
-            if after in seen:
-                continue
-            seen.add(after)
-            report.checked += 1
-            mark = own_status(api, w.repo, after)
-            state = (mark or {}).get("state")
-            if state in FINAL_STATES:
-                continue
-            short = after[:7]
-            link = f"[{short}](https://github.com/{w.repo}/commit/{after})"
-            if state == "pending":
-                report.problems.append(Problem(
-                    f"{w.repo}@{after}", w.repo,
-                    f"{link} ({a.get('activity_type')}) is still marked pending "
-                    f"{_hours(age)} after the push, so the scheduled re-check is not "
-                    f"running: {(mark or {}).get('description') or ''}"))
-                continue
-            how = run_state(api, w, after)
-            if how == "concluded":
-                continue
-            report.problems.append(Problem(
-                f"{w.repo}@{after}", w.repo,
-                f"{link} ({a.get('activity_type')}) has no main-watch conclusion "
-                f"{_hours(age)} after the push: {how}"))
     except gh.GitHubError as e:
         report.problems.append(Problem(
             f"{w.repo}:read", w.repo,
-            f"could not read the repo with the audit token ({e}). The token needs read access "
-            "to Metadata, Contents, Commit statuses and Actions on this repo."))
+            f"could not read the repo's pushes with the audit token ({e}). The token needs "
+            "read access to Metadata, Contents, Commit statuses and Actions on this repo.",
+            once=False))
+        return report
+    seen: Set[str] = set()
+    for a in activity:
+        ts = parse_time(a.get("timestamp"))
+        if ts is None or ts < oldest or ts > newest:
+            continue
+        age = now - ts
+        after = a.get("after") or ZERO_SHA
+        if a.get("activity_type") == "branch_deletion" or after == ZERO_SHA:
+            report.problems.append(Problem(
+                f"{w.repo}@deleted@{a.get('id') or a.get('timestamp')}", w.repo,
+                f"`{w.branch}` was deleted {_hours(age)} ago"))
+            continue
+        if after in seen:
+            continue
+        seen.add(after)
+        report.checked += 1
+        try:
+            report.problems.extend(check_push(api, w, a, age))
+        except gh.GitHubError as e:
+            # One push that cannot be read must not hide the others.
+            report.problems.append(Problem(
+                f"{w.repo}@{after}:error", w.repo,
+                f"could not check push {after[:7]} ({e})", once=False))
     return report
 
 
@@ -166,31 +206,42 @@ def token_expiry_problem(api: gh.GitHub, now: dt.datetime) -> Optional[Problem]:
             .replace(tzinfo=dt.timezone.utc)
     except ValueError:
         return Problem("token:expiry-unreadable", "",
-                       f"could not read the audit token's expiry `{raw}`")
+                       f"could not read the audit token's expiry `{raw}`", once=False)
     if expires - now > dt.timedelta(days=EXPIRY_WARN_DAYS):
         return None
     return Problem(f"token:expires:{expires:%Y-%m-%d}", "",
                    f"the audit token (secret MAIN_WATCH_AUDIT_TOKEN) expires {expires:%Y-%m-%d}; "
-                   "make a new one and update the secret")
+                   "make a new one and update the secret", once=False)
 
 
-def reported_keys(api: gh.GitHub, home: str, label: str) -> Tuple[Set[str], Optional[int]]:
-    """Keys the newest audit issue (open or closed) already reported, and its number if open."""
+def reported_keys(api: gh.GitHub, home: str,
+                  label: str) -> Tuple[Set[str], Optional[int], Set[str]]:
+    """Keys the recent audit issues reported (open or closed), the open issue's
+    number, and the keys that open issue carries."""
     issues = api.get(f"/repos/{home}/issues", {"labels": label, "state": "all",
                                                "sort": "created", "direction": "desc",
                                                "per_page": 10}) or []
     issues = [i for i in issues if "pull_request" not in i]
-    if not issues:
-        return set(), None
-    issue = issues[0]
-    texts = [issue.get("body") or ""]
-    texts += [c.get("body") or "" for c in
-              api.paginate(f"/repos/{home}/issues/{issue['number']}/comments")]
-    keys: Set[str] = set()
-    for t in texts:
-        for m in KEYS_RE.finditer(t):
-            keys.update(k for k in m.group(1).split() if k)
-    return keys, (issue["number"] if issue.get("state") == "open" else None)
+    every: Set[str] = set()
+    open_number: Optional[int] = None
+    open_keys: Set[str] = set()
+    for issue in issues:
+        texts = [issue.get("body") or ""]
+        texts += [c.get("body") or "" for c in
+                  api.paginate(f"/repos/{home}/issues/{issue['number']}/comments")]
+        keys = {k for t in texts for m in KEYS_RE.finditer(t) for k in m.group(1).split() if k}
+        every |= keys
+        if issue.get("state") == "open" and open_number is None:
+            open_number, open_keys = issue["number"], keys
+    return every, open_number, open_keys
+
+
+def new_keys(problems: List[Problem], every: Set[str], open_keys: Set[str]) -> Set[str]:
+    """Push facts are new until any issue listed them; standing conditions are
+    new until an OPEN issue lists them (closing the issue does not silence a
+    token that still cannot read a repo)."""
+    return {p.key for p in problems
+            if (p.key not in every if p.once else p.key not in open_keys)}
 
 
 def render_alert(problems: List[Problem], new: Set[str], run_url: str) -> str:
@@ -251,14 +302,15 @@ def main() -> int:
             blind = True
             problems.append(Problem("token:missing", "", "the MAIN_WATCH_AUDIT_TOKEN secret is "
                                     "not set, so no repo was audited (README, main-watch "
-                                    "audit, has the token recipe)"))
+                                    "audit, has the token recipe)", once=False))
         else:
             api = gh.GitHub(token, api_url)
             try:
                 expiry = token_expiry_problem(api, now)
             except gh.GitHubError as e:
                 blind = True
-                expiry = Problem("token:rejected", "", f"the audit token was rejected ({e})")
+                expiry = Problem("token:rejected", "", f"the audit token was rejected ({e})",
+                                 once=False)
             if expiry:
                 problems.append(expiry)
             if not blind:
@@ -266,13 +318,15 @@ def main() -> int:
                     r = audit_repo(api, w, now, grace, lookback)
                     reports.append(r)
                     problems.extend(r.problems)
-                if reports and all(any(p.key.endswith(":read") for p in r.problems)
-                                   for r in reports):
+                # Any repo the token cannot read is a repo nobody audits: the
+                # run goes red, not just the one issue line.
+                if any(p.key.endswith(":read") for r in reports for p in r.problems):
                     blind = True
     except Exception as e:  # noqa: BLE001  the audit failing must be loud
         blind = True
         problems.append(Problem(f"audit:crash:{type(e).__name__}", "",
-                                f"the audit itself failed: {type(e).__name__}: {e}"))
+                                f"the audit itself failed: {type(e).__name__}: {e}",
+                                once=False))
 
     lines = [f"## main-watch-audit: {len(problems)} problem(s)", "",
              f"Window: pushes {gh.env_input('lookback-hours', '72')} h to "
@@ -288,8 +342,8 @@ def main() -> int:
     failed = blind
     if problems:
         try:
-            done, open_issue = reported_keys(home_api, home, label)
-            new = {p.key for p in problems} - done
+            every, open_issue, open_keys = reported_keys(home_api, home, label)
+            new = new_keys(problems, every, open_keys)
             if new:
                 alert = raise_audit_alert(home_api, home, label,
                                           render_alert(problems, new, run_url), open_issue)

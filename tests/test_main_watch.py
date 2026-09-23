@@ -392,20 +392,70 @@ class AllGreenTests(JudgeHelpers):
         v = self.judge(runs=runs, suites=[suite(1), suite(2)])
         self.assertEqual(v.state, "flag")
 
+    POLICY_RUNS = {f"GET {R}/actions/runs": {"workflow_runs": [
+        {"check_suite_id": 1, "path": ".github/workflows/pr-policy.yml"},
+        {"check_suite_id": 2, "path": ".github/workflows/pr-policy.yml"},
+        {"check_suite_id": 3, "path": ".github/workflows/pr-policy.yml"},
+        {"check_suite_id": 4, "path": ".github/workflows/ci.yml"}]}}
+
     def test_failed_run_rerun_green_on_the_same_head_is_green(self):
-        # pr-policy failed, the body was fixed, the `edited` run passed: two
+        # pr-policy failed, the body was fixed, the `edited` run passed: three
         # suites on one head (seen live on cpapclarity).
         runs = [run("policy / pr-policy", conclusion="failure", suite=1),
                 run("policy / pr-policy", conclusion="failure", suite=2),
-                run("policy / pr-policy", suite=3)]
-        v = self.judge(runs=runs, suites=[suite(1), suite(2), suite(3)])
+                run("policy / pr-policy", suite=3), run("test", suite=4)]
+        v = self.judge(runs=runs, suites=[suite(i) for i in (1, 2, 3, 4)],
+                       extra_routes=self.POLICY_RUNS)
         self.assertEqual(v.state, "pass", v.reason)
 
     def test_rerun_still_running_waits(self):
         runs = [run("policy / pr-policy", conclusion="failure", suite=1),
-                run("policy / pr-policy", status="queued", suite=2)]
-        v = self.judge(runs=runs, suites=[suite(1), suite(2)])
+                run("policy / pr-policy", status="queued", suite=2), run("test", suite=4)]
+        v = self.judge(runs=runs, suites=[suite(1), suite(2), suite(4)],
+                       extra_routes=self.POLICY_RUNS)
         self.assertEqual(v.state, "pending")
+
+    def test_without_the_actions_api_every_suite_counts_on_its_own(self):
+        # Strict fallback: a red run in an older suite stays red, and it says why.
+        runs = [run("policy / pr-policy", conclusion="failure", suite=1),
+                run("policy / pr-policy", suite=3), run("test", suite=4)]
+        with mock.patch.object(gh, "annotate") as annotate:
+            v = self.judge(runs=runs, suites=[suite(1), suite(3), suite(4)],
+                           extra_routes={f"GET {R}/actions/runs": gh.GitHubError("no", 403)})
+        self.assertEqual(v.state, "flag")
+        self.assertIn("actions: read", annotate.call_args[0][1])
+
+    def test_policy_jobs_alone_do_not_count_as_the_prs_checks(self):
+        # pr-policy runs on every PR; a PR whose CI never ran must not pass on it.
+        runs = [run("policy / pr-policy"), run("watch / main-watch")]
+        self.assertEqual(self.judge(runs=runs).state, "pending")
+        v = self.judge(runs=runs, now=LATE)
+        self.assertEqual(v.state, "flag")
+        self.assertIn("no checks ran", v.reason)
+
+    def test_policy_job_failure_still_counts(self):
+        v = self.judge(runs=[run("test"), run("policy / pr-policy", conclusion="failure")])
+        self.assertEqual(v.state, "flag")
+
+    def test_newest_run_of_a_workflow_cancelled_before_any_job_is_red(self):
+        wf = {f"GET {R}/actions/runs": {"workflow_runs": [
+            {"check_suite_id": 1, "path": ".github/workflows/ci.yml"},
+            {"check_suite_id": 2, "path": ".github/workflows/lint.yml"}]}}
+        v = self.judge(runs=[run("test", suite=1)],
+                       suites=[suite(1), suite(2, conclusion="cancelled")], extra_routes=wf)
+        self.assertEqual(v.state, "flag")
+        self.assertIn(".github/workflows/lint.yml was cancelled", v.reason)
+
+    def test_post_merge_suite_does_not_supersede_a_failed_pr_suite(self):
+        # Fast-forward: main's push run of ci.yml shares the sha and is newer.
+        wf = {f"GET {R}/actions/runs": {"workflow_runs": [
+            {"check_suite_id": 1, "path": ".github/workflows/ci.yml"},
+            {"check_suite_id": 2, "path": ".github/workflows/ci.yml"},
+            {"check_suite_id": 3, "path": ".github/workflows/other.yml"}]}}
+        v = self.judge(runs=[run("x", suite=3)],
+                       suites=[suite(1, conclusion="startup_failure"),
+                               suite(2, branch="main"), suite(3)], extra_routes=wf)
+        self.assertEqual(v.state, "flag")
 
     def test_same_job_name_in_two_workflows_counts_twice(self):
         runs = [run("test", conclusion="failure", suite=1), run("test", suite=2)]
@@ -850,11 +900,22 @@ class MainTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("ZeroDivisionError", summary)
 
-    def test_push_to_other_protected_branch_warns(self):
+    def test_push_to_other_protected_branch_is_an_error(self):
+        # The caller watches main but main-watch was told another branch:
+        # nothing was checked, so the run must not look green.
         with mock.patch.object(gh, "annotate") as annotate:
             code, _, _, _ = self.run_main({}, event(ref="refs/heads/master"))
-        self.assertEqual(code, 0)
-        self.assertEqual(annotate.call_args[0][0], "warning")
+        self.assertEqual(code, 1)
+        self.assertEqual(annotate.call_args[0][0], "error")
+
+    def test_rewind_marks_the_new_tip_failed(self):
+        routes = {**self.compare(status="behind"),
+                  f"GET {R}/issues": [], f"POST {R}/labels": {}, f"POST {R}/issues": {"number": 2}}
+        code, _, _, fake = self.run_main(routes, event())
+        self.assertEqual(code, 1)
+        st = self.statuses(fake)[C]
+        self.assertEqual(st["state"], "failure")
+        self.assertIn("Force push", st["description"])
 
     def test_bad_allow_rules_fail_loudly(self):
         code, summary, _, _ = self.run_main({}, event(), {"allow-rules": "nope"})
@@ -952,8 +1013,9 @@ class RecheckTests(unittest.TestCase):
         self.assertEqual(set(self.statuses(fake)), {C})
         self.assertEqual(self.statuses(fake)[C]["state"], "success")
         self.assertEqual(self.issue_bodies(fake), [])
-        since = [c for c in fake.calls if c[1] == f"{R}/commits"][0][2]["since"]
-        self.assertEqual(since, "2026-09-20T22:00:00Z")   # 24 h + 180 min back
+        # By position, not date: a commit inside a merged PR keeps an old date.
+        params = [c for c in fake.calls if c[1] == f"{R}/commits"][0][2]
+        self.assertEqual(params, {"sha": "main", "per_page": 50})
 
     def test_still_running_stays_pending(self):
         code, _, out, fake = self.recheck(self.base_routes([run("Vitest", status="queued")]))
@@ -987,6 +1049,7 @@ class RecheckTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("result=pass", out)
         self.assertIn("is waiting on checks", summary)
+        self.assertIn("None of the 1 newest commits", summary)
         self.assertEqual(fake.posts, [])
 
     def test_description_without_pr_falls_back_to_a_full_verdict(self):
