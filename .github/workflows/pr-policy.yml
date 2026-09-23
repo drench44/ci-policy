@@ -1,0 +1,72 @@
+# Reusable PR policy check. Call it from a repo's workflow; see
+# examples/pr-policy.yml. It checks three things and nothing else:
+#   1. the PR body says which review band ran (zero to three review agents),
+#   2. a PR that says it fixes a regression adds or changes a test file,
+#   3. size: warn over 800 changed lines, fail over 2,500 unless the
+#      size-override label is on the PR or the body has "Size-override: <reason>".
+#      Lockfiles, generated and vendored files are not counted.
+name: pr-policy
+
+on:
+  workflow_call:
+    inputs:
+      runs-on:
+        description: >-
+          JSON for runs-on. Private repos: '["self-hosted","omen"]' (hosted
+          minutes are used up). Public repos: '"ubuntu-latest"'.
+        type: string
+        default: '"ubuntu-latest"'
+      ci-policy-ref:
+        description: Ref of drench44/ci-policy to run. Keep it the same as the ref in `uses:`.
+        type: string
+        default: main
+      owners:
+        description: Logins the policy applies to (comma separated). Everyone else passes with a notice.
+        type: string
+        default: drench44
+      size-warn:
+        type: string
+        default: "800"
+      size-fail:
+        type: string
+        default: "2500"
+      size-override-label:
+        type: string
+        default: size-override
+      size-ignore-globs-extra:
+        description: More globs not to count toward size (newline or comma separated).
+        type: string
+        default: ""
+      test-globs-extra:
+        description: More globs that count as test files.
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  pr-policy:
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
+    timeout-minutes: 5
+    steps:
+      - name: Check out ci-policy
+        uses: actions/checkout@v4
+        with:
+          repository: drench44/ci-policy
+          ref: ${{ inputs.ci-policy-ref }}
+          path: .ci-policy
+          persist-credentials: false
+      - name: Check the pull request
+        env:
+          PYTHONPATH: ${{ github.workspace }}/.ci-policy/lib
+          PYTHONDONTWRITEBYTECODE: "1"
+          INPUT_TOKEN: ${{ github.token }}
+          INPUT_OWNERS: ${{ inputs.owners }}
+          INPUT_SIZE_WARN: ${{ inputs.size-warn }}
+          INPUT_SIZE_FAIL: ${{ inputs.size-fail }}
+          INPUT_SIZE_OVERRIDE_LABEL: ${{ inputs.size-override-label }}
+          INPUT_SIZE_IGNORE_GLOBS_EXTRA: ${{ inputs.size-ignore-globs-extra }}
+          INPUT_TEST_GLOBS_EXTRA: ${{ inputs.test-globs-extra }}
+        run: python3 -m ci_policy.pr_policy

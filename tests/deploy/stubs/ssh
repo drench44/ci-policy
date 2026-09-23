@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Fake ssh: log the call, then run the remote command locally.
+S="$STUB_STATE"
+while [[ "${1:-}" == -o ]]; do shift 2; done
+host="$1"; shift
+printf 'ssh %s %s\n' "$host" "$*" >>"$S/calls"
+[[ -e "$S/ssh_down" ]] && { echo "ssh: connect to host $host: timed out" >&2; exit 255; }
+exec bash -c "$*"
