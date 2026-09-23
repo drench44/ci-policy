@@ -212,8 +212,13 @@ Machine-local exception on both: weather-dashboard's vendored
    (`DL_HEALTH_FRESH`). An endpoint that only says ok is how a deploy deleted
    a box's `.env` and a card vanished for a day.
 2. Records the rollback point: tags each running image
-   `<image>:pre-<time>-<sha>` (the newest few are kept; hand-made `pre-*`
-   tags are never pruned), snapshots the compose directory on the box, and
+   `<image>:pre-<time>-<sha>`, where `<image>` is that service's own
+   `image:` from `docker compose config --format json` (or
+   `<project>-<service>` for a build-only service), never an image of a
+   service it depends on. After a healthy deploy the newest
+   `DL_SNAPSHOT_KEEP` (default 5) such tags per image are kept; only the
+   exact `pre-<YYYYMMDDTHHMMSSZ>-<12 hex>` shape is pruned, so hand-made
+   `pre-*` tags stay. It also snapshots the compose directory on the box, and
    pushes git tag `rollback-point/<service>/<time>` on the commit the box was
    running.
 3. Runs the config's `dl_sync`, then checks required files and env values on
