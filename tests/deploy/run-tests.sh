@@ -754,8 +754,8 @@ for cfg in '{"name":"hub","services":{"other":{"image":"x"}}}' \
            '{"name":"hub","services":{"web":{"command":"x"}}}' \
            'not json' \
            '{"name":"hub","services":{"web":{"image":"a b"}}}' \
-           '{"services":{"web":{"build":{"context":"."}}}}' \
-           '{"name":"hub","services":{"web":{"image":"hub-web@sha256:abc"}}}'; do
+           '{"name":"hub","services":{"web":{"image":"hub-web@sha256:abc"}}}' \
+           '{"services":{"web":{"build":{"context":"."}}}}'; do
   printf '%s\n' "$cfg" >"$STUB_STATE/config_json"; : >"$STUB_STATE/calls"
   run_deploy DL_TAG_PUSH=0
   assert_eq "$RC" 3 "(config $cfg) $OUT"
