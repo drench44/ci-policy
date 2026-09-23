@@ -1,7 +1,7 @@
 # shellcheck shell=bash
 # deploy-lib.sh: shared homelab docker compose deploy with a real health gate
 # and automatic rollback. Canonical source: drench44/ci-policy deploy/deploy-lib.sh
-DL_LIB_VERSION="2.1.0"
+DL_LIB_VERSION="2.1.1"
 #
 # Most repos should not source this directly: write a small config file and
 # run deploy/homelab-deploy <config> (see deploy/example.deploy.conf).
@@ -117,6 +117,14 @@ _dl_remote_dir() {
   fi
 }
 
+# Every ssh here runs with -n (stdin from /dev/null). None of them needs
+# input, and ssh otherwise reads stdin: called inside a `while read` loop it
+# swallowed the rest of the loop's input, so a rollback of several services
+# on a remote box retagged and recreated only the FIRST one and still called
+# the service "rolled back" if that one answered. Found by the first real
+# rollback drill, 2026-09-23 (a three-service stack came back on the bad web
+# image).
+
 # Run a bash snippet inside DL_COMPOSE_DIR, locally or over ssh. Extra
 # arguments become $1.. of the snippet.
 dl_sh() {
@@ -124,7 +132,7 @@ dl_sh() {
   if [[ -n "${DL_REMOTE:-}" ]]; then
     local args=""
     (($#)) && args=$(printf ' %q' "$@")
-    ssh -o BatchMode=yes "$DL_REMOTE" \
+    ssh -n -o BatchMode=yes "$DL_REMOTE" \
       "cd $(_dl_remote_dir "$DL_COMPOSE_DIR") && bash -c $(printf '%q' "$script") dl-sh$args"
   else
     local dir="${DL_COMPOSE_DIR/#\~/$HOME}"
@@ -137,7 +145,7 @@ dl_docker() {
   if [[ -n "${DL_REMOTE:-}" ]]; then
     local quoted
     quoted=$(printf '%q ' "$@")
-    ssh -o BatchMode=yes "$DL_REMOTE" "cd $(_dl_remote_dir "$DL_COMPOSE_DIR") && docker $quoted"
+    ssh -n -o BatchMode=yes "$DL_REMOTE" "cd $(_dl_remote_dir "$DL_COMPOSE_DIR") && docker $quoted"
   else
     local dir="${DL_COMPOSE_DIR/#\~/$HOME}"
     (cd "$dir" && docker "$@")
@@ -349,10 +357,10 @@ dl_prune_pre_tags() {
     [[ -n "$svc" ]] || continue
     while IFS= read -r old; do
       [[ -n "$old" ]] || continue
-      dl_docker rmi "$repo:$old" >/dev/null 2>&1 || dl_warn "could not remove old tag $repo:$old"
+      dl_docker rmi "$repo:$old" </dev/null >/dev/null 2>&1 || dl_warn "could not remove old tag $repo:$old"
     # Only tags this library wrote (pre-<UTC stamp>-<sha>); hand-made tags
     # such as pre-port-abc stay. Never the one this run just made.
-    done < <(dl_docker image ls --format '{{.Tag}}' "$repo" 2>/dev/null \
+    done < <(dl_docker image ls --format '{{.Tag}}' "$repo" </dev/null 2>/dev/null \
                | grep -E '^pre-[0-9]{8}T[0-9]{6}Z-[0-9a-f]+$' | grep -vx "$DL_PRE_TAG" \
                | sort -r | tail -n +"$keep")
   done <<<"${DL_PRE:-}"
@@ -491,7 +499,7 @@ dl_health_once() {
   local body errf ok=1
   errf=$(mktemp "${TMPDIR:-/tmp}/dl-health.XXXXXX") || { printf 'mktemp failed'; return 1; }
   if [[ "${DL_HEALTH_FROM:-local}" == remote ]]; then
-    body=$(ssh -o BatchMode=yes -o LogLevel=ERROR "$DL_REMOTE" \
+    body=$(ssh -n -o BatchMode=yes -o LogLevel=ERROR "$DL_REMOTE" \
       "curl -fsS --max-time 10 $(printf '%q' "$DL_HEALTH_URL")" 2>"$errf") || ok=0
   else
     body=$(curl -fsS --max-time 10 "$DL_HEALTH_URL" 2>"$errf") || ok=0
@@ -575,7 +583,7 @@ dl_rollback() {
   local svc repo tag svcs=()
   while read -r svc repo tag; do
     [[ -n "$svc" ]] || continue
-    dl_docker tag "$repo:$DL_PRE_TAG" "$repo:$tag" \
+    dl_docker tag "$repo:$DL_PRE_TAG" "$repo:$tag" </dev/null \
       || { dl_err "could not retag $repo:$DL_PRE_TAG"; return 1; }
     svcs+=("$svc")
   done <<<"$DL_PRE"

@@ -706,6 +706,22 @@ OUT=$(PATH="$HERE/stubs:$PATH" bash "$HERE/../../deploy/homelab-deploy" "$T/repo
 assert_eq "$RC" 0 "$OUT"
 teardown
 
+setup "a remote rollback puts back EVERY service, not just the first (2.1.1)"
+printf 'go2rtc\nweb\nwyze\n' >"$STUB_STATE/services"
+for svc in go2rtc wyze; do
+  echo "hub-$svc" >"$STUB_STATE/images/$svc"; echo "c-$svc" >"$STUB_STATE/ps/$svc"
+  echo "sha256:OLD-$svc" >"$STUB_STATE/inspect/c-$svc"
+done
+echo fail >"$STUB_STATE/health"
+mkdir -p "$T/home/box"
+run_deploy DL_REMOTE=box "HOME='$T/home'" "DL_COMPOSE_DIR='~/box'" DL_HEALTH_TIMEOUT=0 DL_TAG_PUSH=0
+assert_contains "$CALLS" "docker tag hub-go2rtc:$PRE hub-go2rtc:latest"
+assert_contains "$CALLS" "docker tag hub-web:$PRE hub-web:latest"
+assert_contains "$CALLS" "docker tag hub-wyze:$PRE hub-wyze:latest"
+assert_contains "$CALLS" "up -d --no-build --force-recreate go2rtc web wyze"
+assert_eq "$(cat "$STUB_STATE/tags/hub-web_latest")" "sha256:OLDID" "(web really back on its old image)"
+teardown
+
 # ------------------------------------------------ dl_health_extra (2.1.0)
 
 setup "dl_health_extra runs after the JSON passes, with the body and the commit"
