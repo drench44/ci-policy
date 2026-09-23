@@ -706,5 +706,64 @@ OUT=$(PATH="$HERE/stubs:$PATH" bash "$HERE/../../deploy/homelab-deploy" "$T/repo
 assert_eq "$RC" 0 "$OUT"
 teardown
 
+# ------------------------------------------------ dl_health_extra (2.1.0)
+
+setup "dl_health_extra runs after the JSON passes, with the body and the commit"
+run_deploy DL_TAG_PUSH=0 "dl_health_extra() { printf '%s|%s\n' \"\$1\" \"\$DL_FULL_SHA\" >>'$T/hook'; }"
+assert_eq "$RC" 0
+assert_eq "$(cat "$T/hook")" "{\"ok\":true}|$SHA" "(one call, body and deployed commit)"
+teardown
+
+setup "a failing dl_health_extra rolls back, and its output is the reason"
+run_deploy DL_HEALTH_TIMEOUT=0 DL_TAG_PUSH=0 \
+  "dl_health_extra() { n=\$(( \$(cat '$T/n' 2>/dev/null || echo 0) + 1 )); echo \$n >'$T/n'; [ \$n -gt 1 ] && return 0; echo noise; echo 'web published on 0.0.0.0' >&2; return 5; }"
+assert_eq "$RC" 1
+assert_contains "$OUT" "dl_health_extra failed (exit 5): noise web published on 0.0.0.0"
+assert_contains "$CALLS" "docker compose up -d --no-build --force-recreate web"
+assert_contains "$OUT" "rolled back and the old version is healthy"
+teardown
+
+setup "dl_health_extra is not run while the JSON gate fails"
+printf 'ok {"ok":false}\nok {"ok":true}\n' >"$STUB_STATE/health"
+run_deploy DL_HEALTH_TIMEOUT=5 DL_TAG_PUSH=0 "dl_health_extra() { echo x >>'$T/hook'; }"
+assert_eq "$RC" 0
+assert_eq "$(wc -l <"$T/hook" | tr -d ' ')" "1" "(only the probe whose JSON passed ran the hook)"
+teardown
+
+setup "dl_health_extra cannot change the deploy's variables"
+run_deploy DL_TAG_PUSH=0 "dl_health_extra() { DL_PRE=clobbered; DL_SERVICE=other; }"
+assert_eq "$RC" 0
+assert_contains "$OUT" "docker tag hub-web:"
+assert_not_contains "$OUT" "clobbered"
+teardown
+
+setup "the settle recheck runs dl_health_extra again"
+run_deploy DL_TAG_PUSH=0 DL_HEALTH_SETTLE=0.1 \
+  "dl_health_extra() { n=\$(( \$(cat '$T/n' 2>/dev/null || echo 0) + 1 )); echo \$n >'$T/n'; [ \$n -lt 2 ] || [ \$n -gt 2 ]; }"
+assert_eq "$RC" 1 "(healthy once, the hook failed on the settle check, rollback healthy)"
+assert_contains "$OUT" "healthy once, then not healthy"
+teardown
+
+setup "a hook alone is still a shallow gate"
+run_deploy DL_HEALTH_JQ= "dl_health_extra() { return 0; }"
+assert_eq "$RC" 3
+assert_contains "$OUT" "the health gate is shallow"
+teardown
+
+setup "--health runs dl_health_extra and reports why it failed"
+cat >"$T/repo/hook.conf" <<EOF
+DL_SERVICE=hub
+DL_COMPOSE_DIR='$T/compose'
+DL_HEALTH_URL=http://box/health
+DL_HEALTH_REQUIRE=.ok
+DL_STATE_DIR='$T/boxstate'
+dl_health_extra() { echo "board did not paint"; return 1; }
+EOF
+git -C "$T/repo" add hook.conf; git -C "$T/repo" commit -qm hook
+OUT=$(PATH="$HERE/stubs:$PATH" bash "$HERE/../../deploy/homelab-deploy" "$T/repo/hook.conf" --health 2>&1); RC=$?
+assert_eq "$RC" 1 "$OUT"
+assert_contains "$OUT" "not healthy: dl_health_extra failed (exit 1): board did not paint"
+teardown
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 (( FAIL == 0 ))

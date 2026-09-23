@@ -1,7 +1,7 @@
 # shellcheck shell=bash
 # deploy-lib.sh: shared homelab docker compose deploy with a real health gate
 # and automatic rollback. Canonical source: drench44/ci-policy deploy/deploy-lib.sh
-DL_LIB_VERSION="2.0.0"
+DL_LIB_VERSION="2.1.0"
 #
 # Most repos should not source this directly: write a small config file and
 # run deploy/homelab-deploy <config> (see deploy/example.deploy.conf).
@@ -27,8 +27,9 @@ DL_LIB_VERSION="2.0.0"
 #   4. Required files and env values on the box. Missing: restore the
 #      snapshot and stop before anything restarts.
 #   5. docker compose up -d --build.
-#   6. Poll the health URL until every requirement holds, or time out; after
-#      DL_HEALTH_SETTLE seconds check once more.
+#   6. Poll the health URL until every requirement holds (and dl_health_extra,
+#      if the config defines it, passes), or time out; after DL_HEALTH_SETTLE
+#      seconds check once more.
 #   7. Healthy: record the new commit in the box state file, create + push
 #      git tag deploy/<service>/<UTC time>-<sha>.
 #      Not healthy: restore the snapshot, retag the pre- image back onto
@@ -85,9 +86,19 @@ DL_LIB_VERSION="2.0.0"
 #   DL_GIT_REMOTE       where tags are pushed. Default origin.
 #   DL_TAG_PUSH         1 = create and push git tags (default), 0 = skip.
 #   DL_ALLOW_DIRTY      1 = allow deploying with uncommitted changes. Default 0.
-# Hook:
+# Hooks:
 #   dl_sync             optional shell function, run after the rollback point is
 #                       recorded and before the restart. Non-zero = roll back files.
+#   dl_health_extra     optional shell function, a check the JSON cannot make (a
+#                       headless page load over the LAN, the ports a container
+#                       publishes). Runs in a subshell on every probe, only after
+#                       the JSON requirements hold, with the response body as $1
+#                       and DL_FULL_SHA set to the commit being judged (empty for
+#                       --health). Non-zero = unhealthy; its last output lines are
+#                       the reason. It must bound its own run time (ssh
+#                       ConnectTimeout, timeout -k): the poll waits for it. It
+#                       adds to the gate, it never replaces it: a config with
+#                       only this hook is still refused as shallow.
 
 dl_log()  { printf '[deploy %s] %s\n' "${DL_SERVICE:-?}" "$*" >&2; }
 dl_warn() { printf '[deploy %s] WARNING: %s\n' "${DL_SERVICE:-?}" "$*" >&2; }
@@ -496,10 +507,18 @@ dl_health_once() {
     return 1
   fi
   local why
-  if why=$(printf '%s' "$body" | jq -e "$(_dl_health_program)" 2>&1 >/dev/null); then
-    return 0
+  if ! why=$(printf '%s' "$body" | jq -e "$(_dl_health_program)" 2>&1 >/dev/null); then
+    printf '%s' "${why:-health program failed}"
+    return 1
   fi
-  printf '%s' "${why:-health program failed}"
+  declare -F dl_health_extra >/dev/null || return 0
+  # A subshell, so the hook cannot change the deploy's own variables or traps;
+  # stderr is kept with stdout because that is where a failing check says why.
+  local out rc=0
+  out=$(dl_health_extra "$body" 2>&1) || rc=$?
+  (( rc == 0 )) && return 0
+  out=$(printf '%s\n' "$out" | grep -v '^[[:space:]]*$' | tail -n 3 | tr '\n' ' ')
+  printf 'dl_health_extra failed (exit %s): %s' "$rc" "$(_dl_trim "${out:0:400}")"
   return 1
 }
 
