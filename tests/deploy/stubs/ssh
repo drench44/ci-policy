@@ -7,7 +7,7 @@ no_stdin=0
 while [[ "${1:-}" == -o || "${1:-}" == -n ]]; do
   if [[ "$1" == -n ]]; then no_stdin=1; shift; else shift 2; fi
 done
-[[ $no_stdin == 1 ]] || cat >/dev/null
+[[ $no_stdin == 1 || -t 0 ]] || cat >/dev/null
 host="$1"; shift
 printf 'ssh %s %s\n' "$host" "$*" >>"$S/calls"
 [[ -e "$S/ssh_down" ]] && { echo "ssh: connect to host $host: timed out" >&2; exit 255; }
