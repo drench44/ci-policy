@@ -272,13 +272,15 @@ def repo_name(remote: str, url: str, cwd: Optional[str] = None) -> Optional[str]
     override = git("config", "--get", "ci-policy.repo", cwd=cwd, check=False).strip()
     if override:
         return override
-    found = allowlist.repo_from_url(url)
-    if found:
-        return found
+    # The configured URL first: git hands hooks the URL after insteadOf
+    # rewriting, which may no longer look like GitHub.
     if remote:
-        remote_url = git("remote", "get-url", remote, cwd=cwd, check=False).strip()
-        return allowlist.repo_from_url(remote_url)
-    return None
+        for configured in git("config", "--get-all", f"remote.{remote}.url", cwd=cwd,
+                              check=False).splitlines():
+            found = allowlist.repo_from_url(configured)
+            if found:
+                return found
+    return allowlist.repo_from_url(url)
 
 
 def _commit_files(sha: str, cwd: Optional[str]) -> List[str]:

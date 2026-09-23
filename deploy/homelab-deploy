@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# homelab-deploy: run one deploy described by a per-repo config file.
+#
+#   deploy/homelab-deploy path/to/deploy.conf            deploy (see deploy-lib.sh)
+#   deploy/homelab-deploy path/to/deploy.conf --health   only run the health gate once
+#                                                        against what runs now, and say why
+#
+# The config file is bash: DL_* settings plus an optional dl_sync function.
+# See deploy/example.deploy.conf. DL_GIT_DIR defaults to the git repo that
+# holds the config file, so it can be run from anywhere.
+set -uo pipefail
+
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+conf="${1:-}"
+mode="${2:-deploy}"
+if [[ -z "$conf" || ! -f "$conf" ]]; then
+  echo "usage: homelab-deploy <config file> [--health]" >&2
+  exit 3
+fi
+conf_dir=$(cd "$(dirname "$conf")" && pwd -P)
+
+# shellcheck source=deploy-lib.sh
+source "$here/deploy-lib.sh"
+DL_GIT_DIR=$(git -C "$conf_dir" rev-parse --show-toplevel 2>/dev/null || printf '%s' "$conf_dir")
+# shellcheck disable=SC1090  # the per-repo config
+source "$conf"
+
+case "$mode" in
+  deploy) dl_run; exit $? ;;
+  --health)
+    dl_preflight || exit 3
+    if reason=$(dl_health_once); then
+      dl_log "healthy: $DL_HEALTH_URL"
+      exit 0
+    fi
+    dl_err "not healthy: $reason"
+    exit 1 ;;
+  *) echo "unknown mode $mode (want --health or nothing)" >&2; exit 3 ;;
+esac
